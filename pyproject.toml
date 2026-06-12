@@ -1,0 +1,24 @@
+[project]
+name = "lux"
+version = "0.1.0"
+description = "A testbed for evaluating structured-light depth algorithms on synthetic data."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python-headless>=4.8",
+]
+
+[project.optional-dependencies]
+neural = ["torch>=2.0"]
+dev = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["lux", "lux.methods"]

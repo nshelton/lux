@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+renders/
+results_real/
+checkpoints/
+.DS_Store
+datasets

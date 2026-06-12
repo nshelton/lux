@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lux — structured-light testbed</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.4 ui-monospace, Menlo, monospace; background: #0d0f12; color: #d6dae0; }
+  #app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+  #side { padding: 14px; border-right: 1px solid #20242b; overflow: auto; }
+  #main { display: flex; flex-direction: column; min-width: 0; }
+  #stage { position: relative; flex: 1; min-height: 0; }
+  canvas { display: block; }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  .sub { color: #7d8694; margin-bottom: 12px; }
+  label { display: block; margin: 12px 0 4px; color: #9aa4b2; }
+  select, button { width: 100%; padding: 6px; background: #161a20; color: #d6dae0; border: 1px solid #2a2f38; border-radius: 5px; }
+  button { cursor: pointer; margin-top: 8px; }
+  .seg { display: flex; gap: 4px; margin-bottom: 6px; }
+  .seg button { margin: 0; font-size: 11px; padding: 5px 4px; }
+  .seg button.on { background: #1b2733; color: #fff; border-color: #2f6189; }
+  table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 11px; }
+  th, td { text-align: right; padding: 3px 5px; border-bottom: 1px solid #1c2027; }
+  th:first-child, td:first-child { text-align: left; }
+  tr.sel td { background: #1b2733; color: #fff; }
+  .hint { color: #6b7280; font-size: 11px; margin-top: 14px; }
+  .legend { margin-top: 10px; height: 10px; border-radius: 3px;
+    background: linear-gradient(90deg, #3366ff, #888, #ff4433); }
+  .legend-l { display: flex; justify-content: space-between; color: #7d8694; font-size: 10px; }
+  .vlabel { position: absolute; top: 8px; padding: 3px 8px; background: #0009; border-radius: 4px; color: #cfd6df; pointer-events: none; }
+  #lbl-gt { left: 10px; }
+  #lbl-pred { left: calc(50% + 10px); }
+  #divider { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: #20242b; pointer-events: none; }
+  #msg { position: absolute; bottom: 10px; left: 10px; color: #7d8694; background: #0008; padding: 4px 8px; border-radius: 4px; }
+  #strip { height: 104px; border-top: 1px solid #20242b; display: flex; align-items: center;
+    gap: 6px; padding: 8px 10px; overflow-x: auto; background: #0b0d10; }
+  #strip .frame { position: relative; flex: 0 0 auto; height: 80px; border: 1px solid #2a2f38; border-radius: 3px; }
+  #strip img { height: 100%; display: block; border-radius: 2px; }
+  #strip .n { position: absolute; bottom: 1px; right: 2px; font-size: 9px; color: #aeb6c2; text-shadow: 0 0 3px #000; }
+  #strip .cap-label { color: #6b7280; flex: 0 0 auto; padding-right: 4px; }
+  /* real (2D) view */
+  #real2d { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: #0d0f12; padding: 16px; }
+  #real2d img { max-width: 100%; max-height: 100%; object-fit: contain; image-rendering: auto; }
+  .note { color: #b58b5a; font-size: 11px; margin-top: 10px; }
+  .kv { color: #9aa4b2; font-size: 11px; margin-top: 8px; }
+  .kv b { color: #d6dae0; font-weight: normal; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>lux</h1>
+    <div class="sub">structured-light testbed</div>
+
+    <div class="seg" id="source">
+      <button data-src="synthetic" class="on">synthetic 3D</button>
+      <button data-src="real">real (PBRT)</button>
+    </div>
+
+    <label>point size <span id="psval" style="color:#7d8694"></span></label>
+    <input type="range" id="psize" min="0.4" max="6" step="0.1" value="2.2" style="width:100%" />
+
+    <!-- SYNTHETIC controls -->
+    <div id="ctrl-synthetic">
+      <label>scene</label>
+      <select id="scene"></select>
+      <label>method (right panel)</label>
+      <select id="method"></select>
+      <button id="reset">reset view</button>
+      <div class="legend"></div>
+      <div class="legend-l"><span id="leg-lo">−5 mm</span><span>0</span><span id="leg-hi">+5 mm</span></div>
+      <table id="scores"><thead></thead><tbody></tbody></table>
+      <div class="hint">Left = ground truth · right = prediction (error-coloured).
+        Panels share one camera — drag to orbit both. Bottom strip = the frames fed to the decoder.</div>
+    </div>
+
+    <!-- REAL controls -->
+    <div id="ctrl-real" style="display:none">
+      <label>scene</label>
+      <select id="rscene"></select>
+      <label>view</label>
+      <div class="seg" id="rview">
+        <button data-v="cloud" class="on">3D cloud</button>
+        <button data-v="white">albedo</button>
+        <button data-v="column">column</button>
+        <button data-v="phase">phase</button>
+        <button data-v="depth">depth</button>
+      </div>
+      <div class="legend"></div>
+      <div class="legend-l"><span>near / col 0</span><span></span><span>far / col max</span></div>
+      <button id="rreset">reset view</button>
+      <div class="kv" id="rinfo"></div>
+      <div class="note" id="rnote"></div>
+      <div class="hint">Gray-coded phase-shift decode of real PBRT captures, triangulated to a
+        metric point cloud (baseline calibrated to the reference sphere).
+        <b>3D cloud</b> = orbit the reconstruction; <b>column</b> = projector correspondence
+        (Gray fringe + sine sub-fringe); <b>phase</b> = sub-fringe fraction; <b>depth</b> = Z map.</div>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="stage">
+      <div class="vlabel" id="lbl-gt">ground truth</div>
+      <div class="vlabel" id="lbl-pred">prediction</div>
+      <div id="divider"></div>
+      <div id="real2d"><img id="rimg" alt=""/></div>
+      <div id="msg">loading…</div>
+    </div>
+    <div id="strip"></div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const RESULTS = '../renders';
+const REAL = '../results_real';
+const ERR_MAX_MM = 5.0;
+const stage = document.getElementById('stage');
+const msg = document.getElementById('msg');
+
+// ---------- 3D renderer (synthetic) ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setScissorTest(true);
+stage.appendChild(renderer.domElement);
+const gtScene = new THREE.Scene();   gtScene.background = new THREE.Color(0x0d0f12);
+const predScene = new THREE.Scene(); predScene.background = new THREE.Color(0x101216);
+const realScene = new THREE.Scene(); realScene.background = new THREE.Color(0x0d0f12);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+camera.position.set(0, 0, -0.3);
+const controls = new OrbitControls(camera, renderer.domElement);
+let gtPoints = null, predPoints = null, realPoints = null, mode = 'synthetic', rview = 'cloud';
+
+function canvasActive() { return mode==='synthetic' || (mode==='real' && rview==='cloud'); }
+function render() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  renderer.setSize(w, h, false);
+  if (mode === 'synthetic') {
+    const hw = Math.floor(w / 2);
+    camera.aspect = hw / h; camera.updateProjectionMatrix();
+    renderer.setViewport(0, 0, hw, h); renderer.setScissor(0, 0, hw, h);
+    renderer.render(gtScene, camera);
+    renderer.setViewport(hw, 0, w - hw, h); renderer.setScissor(hw, 0, w - hw, h);
+    renderer.render(predScene, camera);
+  } else {  // real 3D cloud, single full-viewport panel
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+    renderer.setViewport(0, 0, w, h); renderer.setScissor(0, 0, w, h);
+    renderer.render(realScene, camera);
+  }
+}
+addEventListener('resize', render);
+(function loop(){ requestAnimationFrame(loop); if (canvasActive()){controls.update(); render();} })();
+
+async function loadPLY(url, fallbackColor) {
+  const txt = await (await fetch(url)).text();
+  const lines = txt.split('\n');
+  let i = 0, n = 0, hasColor = false;
+  for (; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (l.startsWith('element vertex')) n = parseInt(l.split(' ')[2]);
+    if (l.startsWith('property uchar red')) hasColor = true;
+    if (l === 'end_header') { i++; break; }
+  }
+  const pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  for (let k = 0; k < n; k++) {
+    const p = lines[i + k].trim().split(/\s+/).map(Number);
+    pos[k*3] = p[0]; pos[k*3+1] = -p[1]; pos[k*3+2] = p[2];
+    if (hasColor) { col[k*3]=p[3]/255; col[k*3+1]=p[4]/255; col[k*3+2]=p[5]/255; }
+    else { col[k*3]=fallbackColor[0]; col[k*3+1]=fallbackColor[1]; col[k*3+2]=fallbackColor[2]; }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  geo.computeBoundingSphere();
+  return geo;
+}
+let pointSize = 0.0022;
+function setPoints(scn, prev, geo) {
+  if (prev) { scn.remove(prev); prev.geometry.dispose(); prev.material.dispose(); }
+  const pts = new THREE.Points(geo, new THREE.PointsMaterial({ size: pointSize, vertexColors: true }));
+  scn.add(pts); return pts;
+}
+const psize = document.getElementById('psize');
+const psval = document.getElementById('psval');
+function applyPointSize() {
+  pointSize = parseFloat(psize.value) / 1000;
+  psval.textContent = pointSize.toFixed(4);
+  for (const p of [gtPoints, predPoints, realPoints]) if (p) p.material.size = pointSize;
+}
+psize.oninput = applyPointSize;
+applyPointSize();
+function frameCamera(geo) {
+  const s = geo.boundingSphere;
+  controls.target.copy(s.center);
+  camera.position.set(s.center.x, s.center.y, s.center.z - s.radius * 2.4);
+  controls.update();
+}
+
+// ---------- synthetic data ----------
+const sceneSel = document.getElementById('scene');
+const methodSel = document.getElementById('method');
+let scores = [];
+function showStrip(sceneName, methodName, nFrames) {
+  const strip = document.getElementById('strip');
+  strip.innerHTML = '<span class="cap-label">captures →</span>';
+  for (let k = 0; k < nFrames; k++) {
+    const id = String(k).padStart(2, '0');
+    const div = document.createElement('div'); div.className = 'frame';
+    div.innerHTML = `<img loading="lazy" src="${RESULTS}/${sceneName}/${methodName}/captures/cap_${id}.png"/><span class="n">${k}</span>`;
+    strip.appendChild(div);
+  }
+}
+async function showSynth(sceneName, methodName) {
+  msg.textContent = `${sceneName} · ${methodName}`;
+  try {
+    const gtGeo = await loadPLY(`${RESULTS}/${sceneName}/gt_cloud.ply`, [0.7,0.7,0.7]);
+    const prGeo = await loadPLY(`${RESULTS}/${sceneName}/${methodName}/pred_cloud.ply`, [0.8,0.4,0.4]);
+    gtPoints = setPoints(gtScene, gtPoints, gtGeo);
+    predPoints = setPoints(predScene, predPoints, prGeo);
+    frameCamera(gtGeo);
+    document.getElementById('lbl-pred').textContent = methodName;
+    const row = scores.find(s => s.scene === sceneName && s.method === methodName);
+    showStrip(sceneName, methodName, row ? row.n_patterns : 0);
+    msg.textContent = '';
+  } catch (e) { msg.textContent = 'missing artifact — run scripts/run_benchmark.py'; }
+}
+function renderScores() {
+  const rows = scores.filter(s => s.scene === sceneSel.value);
+  document.querySelector('#scores thead').innerHTML =
+    '<tr><th>method</th><th>rmse</th><th>med</th><th>bad%</th><th>cmpl%</th></tr>';
+  document.querySelector('#scores tbody').innerHTML = rows.map(r =>
+    `<tr class="${r.method===methodSel.value?'sel':''}"><td>${r.method}</td>`+
+    `<td>${r.rmse_mm.toFixed(2)}</td><td>${r.median_ae_mm.toFixed(2)}</td>`+
+    `<td>${r.bad_pixel_pct.toFixed(0)}</td><td>${r.completeness_pct.toFixed(1)}</td></tr>`).join('');
+}
+sceneSel.onchange = methodSel.onchange = () => { showSynth(sceneSel.value, methodSel.value); renderScores(); };
+document.getElementById('reset').onclick = () => { if (gtPoints) frameCamera(gtPoints.geometry); };
+document.getElementById('leg-lo').textContent = `−${ERR_MAX_MM} mm`;
+document.getElementById('leg-hi').textContent = `+${ERR_MAX_MM} mm`;
+
+// ---------- real (PBRT) data ----------
+const rsceneSel = document.getElementById('rscene');
+const rimg = document.getElementById('rimg');
+let manifest = null;
+async function loadRealCloud(name) {
+  try {
+    const geo = await loadPLY(`${REAL}/${name}/cloud.ply`, [0.7,0.7,0.7]);
+    realPoints = setPoints(realScene, realPoints, geo);
+    frameCamera(geo);
+    msg.textContent = '';
+  } catch (e) { msg.textContent = 'missing cloud.ply — run scripts/run_pbrt_dataset.py'; }
+}
+function showReal() {
+  if (!manifest) return;
+  const name = rsceneSel.value;
+  const e = manifest.scenes.find(s => s.name === name) || {};
+  document.getElementById('rinfo').innerHTML =
+    `points <b>${(e.n_points||0).toLocaleString()}</b> · valid <b>${e.valid_pct}%</b>` +
+    (e.depth_min!=null ? ` · depth <b>${e.depth_min}–${e.depth_max} m</b>` : '');
+  document.getElementById('real2d').style.display = rview==='cloud' ? 'none' : 'flex';
+  renderer.domElement.style.display = rview==='cloud' ? '' : 'none';
+  if (rview === 'cloud') loadRealCloud(name);
+  else { rimg.src = `${REAL}/${name}/${rview}.png`; msg.textContent = ''; }
+}
+document.getElementById('rreset').onclick = () => { if (realPoints) frameCamera(realPoints.geometry); };
+rsceneSel.onchange = showReal;
+document.querySelectorAll('#rview button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#rview button').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); rview = b.dataset.v; showReal();
+});
+
+// ---------- mode switching ----------
+function setMode(src) {
+  mode = src;
+  document.getElementById('ctrl-synthetic').style.display = src==='synthetic' ? '' : 'none';
+  document.getElementById('ctrl-real').style.display = src==='real' ? '' : 'none';
+  document.getElementById('strip').style.display = src==='synthetic' ? 'flex' : 'none';
+  for (const el of ['lbl-gt','lbl-pred','divider']) document.getElementById(el).style.display = src==='synthetic' ? '' : 'none';
+  document.querySelectorAll('#source button').forEach(x => x.classList.toggle('on', x.dataset.src===src));
+  if (src==='real') { msg.textContent=''; renderer.domElement.style.display=''; showReal(); }
+  else {
+    document.getElementById('real2d').style.display = 'none';
+    renderer.domElement.style.display = '';
+    showSynth(sceneSel.value, methodSel.value);
+  }
+}
+document.querySelectorAll('#source button').forEach(b => b.onclick = () => setMode(b.dataset.src));
+
+// ---------- init ----------
+async function init() {
+  try {
+    scores = await (await fetch(`${RESULTS}/scores.json`)).json();
+    for (const s of [...new Set(scores.map(s => s.scene))]) sceneSel.add(new Option(s, s));
+    for (const m of [...new Set(scores.map(s => s.method))]) methodSel.add(new Option(m, m));
+    renderScores();
+  } catch { msg.textContent = 'no renders/scores.json'; }
+  try {
+    manifest = await (await fetch(`${REAL}/manifest.json`)).json();
+    for (const s of manifest.scenes) rsceneSel.add(new Option(s.name, s.name));
+  } catch { /* no real datasets generated */ }
+  setMode('synthetic');
+}
+init();
+</script>
+</body>
+</html>
