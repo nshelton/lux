@@ -27,10 +27,43 @@ from .scene import Scene
 class RenderConfig:
     ambient: float = 0.05          # constant illumination floor, fraction of full scale
     gain: float = 0.9              # projector contribution scale
-    read_noise: float = 0.01       # additive Gaussian sigma (fraction of full scale)
+    read_noise: float = 0.01       # additive white Gaussian sigma (fraction of full scale)
     shot_noise: float = 0.0        # Poisson-like photon noise scale (0 disables)
+    blue_noise: float = 0.0        # high-frequency (blue-spectrum) grain sigma (0 disables)
     cast_shadows: bool = True      # mask points the projector cannot see
-    seed: int = 0
+    seed: int | None = 0           # RNG seed for noise; None = fresh entropy (random)
+
+
+def blue_noise_field(shape, sigma: float, rng) -> np.ndarray:
+    """A zero-mean blue-noise field of std ``sigma`` over ``shape`` (H, W[, C]).
+
+    White Gaussian noise spectrally tilted toward high frequencies (amplitude
+    weighted by radial frequency), so the grain is spatially decorrelated with no
+    low-frequency clumping — perceptually cleaner than white noise. Channels are
+    drawn independently.
+    """
+    if len(shape) == 3:
+        return np.stack([blue_noise_field(shape[:2], sigma, rng) for _ in range(shape[2])], axis=-1)
+    h, w = shape
+    white = rng.standard_normal((h, w))
+    fy = np.fft.fftfreq(h)[:, None]
+    fx = np.fft.fftfreq(w)[None, :]
+    radius = np.sqrt(fx * fx + fy * fy)            # 0 at DC, grows with frequency
+    bn = np.fft.ifft2(np.fft.fft2(white) * radius).real
+    s = bn.std()
+    return bn * (sigma / s) if s > 0 else bn
+
+
+def add_sensor_noise(img: np.ndarray, cfg: "RenderConfig", rng) -> np.ndarray:
+    """Add shot + read (white) + blue-noise grain to an image (not clipped)."""
+    out = img
+    if cfg.shot_noise > 0:
+        out = out + rng.normal(0.0, cfg.shot_noise * np.sqrt(np.maximum(out, 0)), out.shape)
+    if cfg.read_noise > 0:
+        out = out + rng.normal(0.0, cfg.read_noise, out.shape)
+    if cfg.blue_noise > 0:
+        out = out + blue_noise_field(out.shape, cfg.blue_noise, rng)
+    return out
 
 
 @dataclass
@@ -134,12 +167,7 @@ def render(scene: Scene, patterns: np.ndarray, rig: Rig, cfg: RenderConfig | Non
     for i, pat in enumerate(patterns):
         proj_val = sample_pattern(pat, u_p, v_p)
         signal = scene.albedo * (cfg.ambient + cfg.gain * np.where(lit, proj_val, 0.0))
-        img = signal.copy()
-        if cfg.shot_noise > 0:
-            img = img + rng.normal(0.0, cfg.shot_noise * np.sqrt(np.maximum(img, 0)), img.shape)
-        if cfg.read_noise > 0:
-            img = img + rng.normal(0.0, cfg.read_noise, img.shape)
-        images[i] = np.clip(img, 0.0, 1.0)
+        images[i] = np.clip(add_sensor_noise(signal, cfg, rng), 0.0, 1.0)
 
     gt_col = np.where(lit, u_p, np.nan)
     return Capture(images=images, lit_mask=lit, gt_proj_col=gt_col, scene=scene, rig=rig)

@@ -47,18 +47,60 @@ class Intrinsics:
         )
 
 
+def look_at_basis(forward: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """World->device rotation for a device looking along ``forward`` in the world.
+
+    Rows are the device axes expressed in world coordinates, in lux's image order:
+    ``[+X right, +Y down, +Z forward]``, so ``X_device = R @ (X_world - centre)``.
+    ``up`` is the world direction that should appear at the **top** of the image
+    (image-up is ``-Y``, so the device's down axis is ``-up`` orthogonalised against
+    forward). The default camera (forward ``+Z``, up ``(0,-1,0)``) gives identity.
+    """
+    z = np.asarray(forward, float)
+    z = z / np.linalg.norm(z)
+    u = np.asarray(up, float)
+    y = (u @ z) * z - u                      # image-down ~ -up, orthogonal to forward
+    if np.linalg.norm(y) < 1e-9:             # up parallel to forward -> pick any
+        y = np.array([0.0, 1.0, 0.0]) - z * z[1]
+    y = y / np.linalg.norm(y)
+    x = np.cross(y, z)
+    x = x / np.linalg.norm(x)
+    return np.array([x, y, z])
+
+
 @dataclass(frozen=True)
 class Rig:
     """A calibrated camera + projector pair.
 
-    ``R`` (3x3) and ``t`` (3,) transform camera-frame points into the
-    projector frame: ``X_proj = R @ X_cam + t``.
+    ``R`` (3x3) and ``t`` (3,) transform camera-frame points into the projector
+    frame: ``X_proj = R @ X_cam + t`` — the relative transform every SL routine
+    uses (triangulation, correspondence). The optional world poses ``(R_cam, C_cam)``
+    and ``(R_proj, C_proj)`` place each device in a shared world frame (rows of
+    ``R_*`` are the device axes in world; ``C_*`` is its centre); renderers use
+    these to support arbitrary device placement. They default to a camera at the
+    origin looking ``+Z`` (so world == camera frame), with the projector pose
+    derived from ``R, t`` — making legacy ``baseline`` rigs behave exactly as before.
     """
 
     camera: Intrinsics
     projector: Intrinsics
     R: np.ndarray
     t: np.ndarray
+    R_cam: np.ndarray = None
+    C_cam: np.ndarray = None
+    R_proj: np.ndarray = None
+    C_proj: np.ndarray = None
+
+    def __post_init__(self):
+        if self.R_cam is None:
+            object.__setattr__(self, "R_cam", np.eye(3))
+        if self.C_cam is None:
+            object.__setattr__(self, "C_cam", np.zeros(3))
+        if self.R_proj is None:                         # projector world pose from R, t
+            object.__setattr__(self, "R_proj", self.R @ self.R_cam)
+        if self.C_proj is None:
+            object.__setattr__(self, "C_proj",
+                               self.C_cam - self.R_cam.T @ (self.R.T @ self.t))
 
     @classmethod
     def make(
@@ -83,6 +125,23 @@ class Rig:
         # Camera origin sits at -baseline in the projector frame.
         t = R @ np.array([-baseline, 0.0, 0.0], dtype=np.float64)
         return cls(camera=camera, projector=projector, R=R, t=t)
+
+    @classmethod
+    def from_poses(cls, camera: Intrinsics, projector: Intrinsics,
+                   R_cam: np.ndarray, C_cam: np.ndarray,
+                   R_proj: np.ndarray, C_proj: np.ndarray) -> "Rig":
+        """Construct a rig from explicit world poses for the camera and projector.
+
+        Each pose is a world->device rotation (see :func:`look_at_basis`) and a
+        world-space centre. The relative ``R, t`` are derived so all SL routines
+        work unchanged: ``R = R_proj @ R_cam.T``, ``t = R_proj @ (C_cam - C_proj)``.
+        """
+        R_cam, C_cam = np.asarray(R_cam, float), np.asarray(C_cam, float)
+        R_proj, C_proj = np.asarray(R_proj, float), np.asarray(C_proj, float)
+        R = R_proj @ R_cam.T
+        t = R_proj @ (C_cam - C_proj)
+        return cls(camera=camera, projector=projector, R=R, t=t,
+                   R_cam=R_cam, C_cam=C_cam, R_proj=R_proj, C_proj=C_proj)
 
 
 def camera_rays(intr: Intrinsics) -> np.ndarray:

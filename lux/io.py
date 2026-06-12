@@ -26,6 +26,20 @@ def save_image(path: str, img: np.ndarray) -> None:
     cv2.imwrite(path, u8)
 
 
+def proj_to_rgb(gt_proj: np.ndarray, proj_width: int, proj_height: int) -> np.ndarray:
+    """Encode a projector-subpixel map ``(H, W, 2)`` as a quick-look RGB image.
+
+    R = row / projector height, G = column / projector width, B = valid (1 where the
+    pixel has a correspondence, else 0). Invalid pixels are black.
+    """
+    valid = np.isfinite(gt_proj[..., 0]) & np.isfinite(gt_proj[..., 1])
+    rgb = np.zeros(gt_proj.shape[:2] + (3,), dtype=np.float64)
+    rgb[..., 0] = np.nan_to_num(gt_proj[..., 1]) / proj_height   # row  -> red
+    rgb[..., 1] = np.nan_to_num(gt_proj[..., 0]) / proj_width    # col  -> green
+    rgb[..., 2] = valid.astype(np.float64)                       # valid -> blue
+    return rgb
+
+
 def load_image(path: str, gray: bool = True) -> np.ndarray:
     """Read a PNG/JPG into a float image in [0, 1]; grayscale (H, W) by default."""
     flag = cv2.IMREAD_GRAYSCALE if gray else cv2.IMREAD_COLOR
