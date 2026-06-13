@@ -5,4 +5,7 @@ renders/
 results_real/
 checkpoints/
 .DS_Store
+._*
+*.egg-info/
 datasets
+evals/*/data

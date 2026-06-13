@@ -31,18 +31,22 @@ from lux import io  # noqa: E402
 from lux.datasets.mitsuba_gen import (  # noqa: E402
     load_geometry, render_capture, render_ground_truth, projector_subpixel,
 )
-from lux.datasets.scene_loader import list_scenes  # noqa: E402
+from lux.datasets.raster_gen import projector_visible  # noqa: E402
+from lux.datasets.scene_loader import (  # noqa: E402
+    list_scenes, load_scene_primitives, load_scene_ambient,
+)
 from lux.datasets.rig_loader import load_rig_spec, build_rig, list_rigs  # noqa: E402
 from lux.datasets.optics import parse_optics  # noqa: E402
 
 
-def render_pattern_dir(rig, geo, patterns_dir, sdir, spp, optics=None):
+def render_pattern_dir(rig, geo, patterns_dir, sdir, spp, optics=None, ambient=0.04):
     """Project a user-supplied folder of PNG patterns and save the captures.
 
     Patterns are projected in filename order; each capture is written as
     ``cap_<pattern-stem>.png``. Pattern images may be any resolution (the
     projector treats them as a texture across its FOV). ``optics`` applies the
-    camera + projector lens model (DoF + distortion) to each capture.
+    camera + projector lens model (DoF + distortion) to each capture; ``ambient``
+    sets the constant environment light.
     """
     files = sorted(p for ext in ("*.png", "*.PNG", "*.jpg", "*.jpeg")
                    for p in Path(patterns_dir).glob(ext))
@@ -59,7 +63,7 @@ def render_pattern_dir(rig, geo, patterns_dir, sdir, spp, optics=None):
         rgb = io.load_image(str(f), gray=False)
         pat = rgb[..., 0] if np.allclose(rgb[..., 0], rgb[..., 1]) and \
             np.allclose(rgb[..., 1], rgb[..., 2]) else rgb
-        cap = render_capture(rig, pat, geometry=geo, spp=spp, optics=optics,
+        cap = render_capture(rig, pat, geometry=geo, spp=spp, optics=optics, ambient=ambient,
                              label=f"{set_name} {i + 1:02d}/{len(files)} {f.name}")
         io.save_image(os.path.join(odir, f"cap_{f.stem}.png"), cap)
         caps.append(cap)
@@ -107,17 +111,22 @@ def main() -> None:
     # ``mitsuba_<scene>`` layout (e.g. blocks -> mitsuba_blocks).
     scene_name = args.name or f"mitsuba_{Path(args.scene).stem}"
 
-    print(f"scene '{args.scene}' -> ./{args.out}/{scene_name}/")
+    ambient = load_scene_ambient(args.scene)    # scene-defined ambient light level
+    print(f"scene '{args.scene}' -> ./{args.out}/{scene_name}/  (ambient {ambient})")
     print("rendering ground truth + albedo ...")
     gt, _ = render_ground_truth(rig, geometry=geo, spp=args.gt_spp, label="ground-truth")
     white = render_capture(rig, np.ones((rig.projector.height, rig.projector.width), np.float32),
-                           geometry=geo, spp=args.spp, label="white-ref")
+                           geometry=geo, spp=args.spp, ambient=ambient, label="white-ref")
     albedo = np.clip(white / max(white.max(), 1e-6), 0, 1)
 
     # The fundamental SL ground truth: exact projector subpixel (col, row) that lit
     # each camera pixel, from GT depth + calibration. Depth is the same information
     # triangulated, so we keep both (gt_depth feeds the cloud/viewer).
     gt_proj = projector_subpixel(rig, gt, proj_optics=optics.projector)
+    # Occlusion is a property of the (shared) geometry; use the analytic raycaster
+    # as the visibility oracle for both backends so it's acne-free on curved surfaces.
+    gt_proj = np.where(projector_visible(rig, load_scene_primitives(args.scene))[..., None],
+                       gt_proj, np.nan)
 
     sdir = io.ensure_dir(os.path.join(args.out, scene_name))
     io.save_npy(os.path.join(sdir, "gt_depth.npy"), gt)
@@ -131,7 +140,7 @@ def main() -> None:
     pts, col = io.depth_to_points(gt, rig, albedo)
     io.save_ply(os.path.join(sdir, "gt_cloud.ply"), pts, col)
 
-    render_pattern_dir(rig, geo, args.patterns, sdir, args.spp, optics=optics)
+    render_pattern_dir(rig, geo, args.patterns, sdir, args.spp, optics=optics, ambient=ambient)
     print(f"\nwrote GT + captures to ./{args.out}/{scene_name}/ (viewable in the synthetic 3D tab)")
 
 

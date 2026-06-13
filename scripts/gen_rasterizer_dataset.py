@@ -27,16 +27,17 @@ import numpy as np  # noqa: E402
 
 from lux import io  # noqa: E402
 from lux.datasets.raster_gen import (  # noqa: E402
-    load_geometry, render_capture, render_ground_truth,
+    load_geometry, render_capture, render_ground_truth, projector_visible,
 )
 from lux.datasets.correspondence import projector_subpixel  # noqa: E402
-from lux.datasets.scene_loader import list_scenes  # noqa: E402
+from lux.datasets.scene_loader import list_scenes, load_scene_ambient  # noqa: E402
 from lux.datasets.rig_loader import load_rig_spec, build_rig, list_rigs  # noqa: E402
 from lux.datasets.optics import parse_optics  # noqa: E402
 from lux.render import RenderConfig  # noqa: E402
 
 
-def render_pattern_dir(rig, geo, patterns_dir, sdir, optics=None, cfg=None):
+def render_pattern_dir(rig, geo, patterns_dir, sdir, optics=None, cfg=None,
+                       montage=True):
     """Project a user-supplied folder of PNG patterns and save the captures.
 
     Patterns are projected in filename order; each capture is written as
@@ -45,7 +46,8 @@ def render_pattern_dir(rig, geo, patterns_dir, sdir, optics=None, cfg=None):
     projector lens model (distortion) to each capture.
     """
     files = sorted(p for ext in ("*.png", "*.PNG", "*.jpg", "*.jpeg")
-                   for p in Path(patterns_dir).glob(ext))
+                   for p in Path(patterns_dir).glob(ext)
+                   if not p.name.startswith("."))   # skip exFAT/macOS ._* sidecars
     if not files:
         raise SystemExit(f"no PNG/JPG patterns found in {patterns_dir!r}")
 
@@ -68,7 +70,8 @@ def render_pattern_dir(rig, geo, patterns_dir, sdir, optics=None, cfg=None):
                              label=f"{set_name} {i + 1:02d}/{len(files)} {f.name}")
         io.save_image(os.path.join(odir, f"cap_{f.stem}.png"), cap)
         caps.append(cap)
-    io.save_image(os.path.join(odir, "captures_montage.png"), io.montage(np.stack(caps)))
+    if montage:
+        io.save_image(os.path.join(odir, "captures_montage.png"), io.montage(np.stack(caps)))
     print(f"wrote {len(caps)} captures to ./{odir}/cap_*.png")
 
 
@@ -101,13 +104,15 @@ def main() -> None:
     # Sensor noise lives in an optional rig-file "noise" block; the captures get it
     # (plus camera lens distortion), but the white-ref / GT stay clean and undistorted.
     nz = rig_spec.get("noise", {})
+    amb = load_scene_ambient(args.scene)        # scene-defined ambient light level
     # seed defaults to None -> noise is freshly random per frame; set "seed" in the
     # noise block for a reproducible (but still per-frame decorrelated) realization.
-    cfg = RenderConfig(read_noise=float(nz.get("read", 0.0)),
+    cfg = RenderConfig(ambient=amb,
+                       read_noise=float(nz.get("read", 0.0)),
                        shot_noise=float(nz.get("shot", 0.0)),
                        blue_noise=float(nz.get("blue", 0.0)),
                        seed=nz.get("seed", None))
-    clean = RenderConfig(read_noise=0.0, shot_noise=0.0, blue_noise=0.0)
+    clean = RenderConfig(ambient=amb, read_noise=0.0, shot_noise=0.0, blue_noise=0.0)
     if optics.projector.has_distortion:
         print(f"  projector distortion dist={optics.projector.dist}")
     if optics.camera.has_distortion:
@@ -133,8 +138,10 @@ def main() -> None:
 
     # The fundamental SL ground truth: exact projector subpixel (col, row) that lit
     # each camera pixel, from GT depth + calibration. Depth is the same information
-    # triangulated, so we keep both (gt_depth feeds the cloud/viewer).
+    # triangulated, so we keep both (gt_depth feeds the cloud/viewer). Points the
+    # projector can't see (occluded / in shadow) are marked invalid.
     gt_proj = projector_subpixel(rig, gt, proj_optics=optics.projector)
+    gt_proj = np.where(projector_visible(rig, geo)[..., None], gt_proj, np.nan)
 
     sdir = io.ensure_dir(os.path.join(args.out, scene_name))
     io.save_npy(os.path.join(sdir, "gt_depth.npy"), gt)

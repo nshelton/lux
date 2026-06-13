@@ -51,10 +51,18 @@ so adding one is just dropping in a file — no code changes. `list_scenes()` /
 `list_rigs()` enumerate the built-ins.
 
 ### Scenes (`scene_loader.py`)
-A scene file is a list of `objects`. Primitives: `plane`, `sphere`, `box`, `wavy`
-(a procedural sinusoidally-displaced mesh emitted as a temp OBJ). `reflectance` is
-a gray scalar or `[r,g,b]`. World == camera frame: camera at origin looking down
-+Z, +X right, +Y down, metres. Built-ins: `blocks`, `wavy`.
+A scene file is a list of `objects` plus an optional top-level `ambient` (0–1,
+default 0.05 via `load_scene_ambient`) for the constant environment light — it
+sets the unlit/shadowed floor (`signal = albedo·(ambient + …)` for raster, a
+`constant` emitter for Mitsuba). Primitives: `plane`, `sphere`, `box`, `wavy`
+(a procedural sinusoidally-displaced surface). A `box` takes an optional
+`rotation` `[rx,ry,rz]` (Euler degrees, applied X→Y→Z; `rot_xyz` matches the
+Mitsuba rotate composition — verified parity). `reflectance` is a gray scalar or
+`[r,g,b]`. Any object may carry a procedural albedo `texture` block
+(`{"type": "checker"|"stripes"|"noise", "scale", "contrast", …}`), evaluated in
+world space at the hit point — **ray-caster only**, Mitsuba ignores it.
+Distances in metres in the scene's own frame (the rig's camera pose
+places the viewer). Built-ins: `blocks`, `wavy`.
 
 ### Rigs (`rig_loader.py`)
 A rig file holds the full camera+projector calibration: each device block is
@@ -127,7 +135,14 @@ renders/<scene>/                 # <scene> defaults to mitsuba_<stem> / raster_<
 estimates (`projector_subpixel(rig, depth, proj_optics)`). It's derived from
 `gt_depth` + calibration with lux's pinhole model, so `triangulate_columns(gt_proj
 [...,0])` recovers `gt_depth` to machine precision. Channel 0 = column, 1 = row.
-Pixels outside the projector frame `[0,w)×[0,h)` are **NaN** (not illuminable).
+Pixels outside the projector frame `[0,w)×[0,h)` are **NaN**, as are pixels the
+projector can't see — the gen scripts mask `gt_proj` with `raster_gen.projector_visible`,
+which tests each point against the **analytic projector-depth raycast** (the same
+oracle the captures' shadows use). So points occluded from the projector (e.g. the
+plane behind a box) are invalid (black in `gt_proj.png`), matching where the captures
+are unlit, *without* shadow acne on curved surfaces. Both backends use it (occlusion
+is a property of the shared geometry). `correspondence.projector_visible` is a
+depth-map-only z-buffer fallback — simpler but self-shadows on grazing/curved surfaces.
 When the projector has distortion, the coordinate is mapped to the *authored*
 (pre-warp) projector coordinate so it matches what a decoder recovers from the
 distortion-warped patterns. `scripts/verify_gt_proj.py` checks this end-to-end by
@@ -194,6 +209,21 @@ python scripts/gen_mitsuba_dataset.py --scene blocks --patterns patterns/colors 
 # render the same dataset ~100x faster (ray-caster)
 python scripts/gen_rasterizer_dataset.py --scene wavy --rig hd --patterns patterns/graycode
 
+# randomized training data (ray-caster): per sample, draws a random scene
+# (plane/tilted-wall/wavy/no background + 4-18 oriented boxes & spheres,
+# procedural textures, frustum-rejection-sampled into view) and a random rig
+# (pose, FOV, baseline + probabilistic noise/bloom/DoF/projector-distortion),
+# writes them as scene.json/rig.json in the sample folder (re-renderable with
+# gen_rasterizer_dataset.py), then renders the standard artifact set.
+# Sample i uses seed+i; sample.json is written last and doubles as the
+# completion marker: reruns resume (skip finished samples; --overwrite forces),
+# higher --seed extends, disjoint seed ranges give train/val splits.
+# --patterns takes multiple sets (G-buffer shared, extra sets ~free);
+# --lean drops human-facing extras (ply/montage/quicklooks); --jobs N parallel.
+# --cam-distort opts into camera distortion (warps captures off the GT's ideal
+# image space); everything else stays pixel-aligned with gt_depth/gt_proj.
+python scripts/gen_training_data.py --n 100 --patterns patterns/marray --jobs 4 --lean
+
 # verify / compare
 python scripts/verify_gt_proj.py --backend raster
 python scripts/compare_backends.py
@@ -201,6 +231,33 @@ python scripts/compare_backends.py
 
 `--patterns` is required. Other flags: `--name` (output folder override), `--out`
 (root, default `renders`); Mitsuba-only: `--spp`, `--gt-spp`.
+
+## Training on the Linux box (RTX 2080 Ti) — env & perf gotchas
+
+Hard-won notes for running `scripts/train_proj_net.py` here (not relevant to the
+renderer itself, but bit us repeatedly):
+
+- **venv can't live on the repo drive.** The repo sits on an exFAT external drive
+  (`/run/media/nshelton/LUX`), which has no symlink support — even
+  `python -m venv --copies` fails on the `lib64` link. The working venv is at
+  **`~/.venvs/lux`** (on NVMe). Run everything with `~/.venvs/lux/bin/python`.
+- **Batch ceiling is 32.** `--mid attn --crop 256 --amp` OOMs at batch 64 and 48
+  on the 11 GB card; batch 32 (~10.3 GB) is the max. Use
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+- **Stage the loaf on NVMe — the single biggest speedup.** Training random-crops
+  from a memmapped loaf (`caps.npy`+`gt.npy`, ~98 GB), which exceeds the 61 GB RAM
+  so it can't be page-cached. Reading those random crops over **exFAT-over-USB
+  halves throughput** (~50 vs ~104 img/s) and leaves the GPU sawtoothing 9-99%
+  while dataloader workers sit in `D`/`exfat_get_block`. The drive's 500 MB/s
+  *sequential* spec is irrelevant — the workload is random-access-latency-bound,
+  where NVMe wins ~100x. Fix: `cp` the loaf dir to `~/datasets/<loaf>` and point
+  `--loaf` there. Diagnose with `ps -o pid,stat,wchan -p <workers>` (D-state on
+  `exfat_get_block` = I/O-bound) and a `/proc/diskstats` read-rate delta.
+- **Heat / hangs.** Sustained 99% util uncapped (~260 W) ran the card hot and the
+  box hung twice early on. `sudo nvidia-smi -pl 140` caps power (~15% slower, much
+  cooler). Also avoid suspend mid-run (NVIDIA-on-Wayland resume failure = black
+  screen, live cursor, no input) — wrap training in
+  `systemd-inhibit --what=idle:sleep` and/or mask the sleep targets.
 
 ## Conventions
 

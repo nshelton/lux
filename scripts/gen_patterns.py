@@ -76,12 +76,79 @@ def _colors(width: int, height: int) -> np.ndarray:
 COLOR_BUILDERS = {"rainbow": _rainbow, "rgb_phase": _rgb_phase, "colors": _colors}
 
 
+# --------------------------------------------------------------------------
+# Monochrome single-shot spatial codes
+# --------------------------------------------------------------------------
+def _marray(width: int, height: int, cell: int = 4, win: int = 5,
+            seed: int = 0) -> np.ndarray:
+    """Single binary frame where every ``win``x``win``-cell window is unique.
+
+    An M-array in the practical sense: a random binary grid of ``cell``-px
+    cells, then iterative repair — hash every sliding window, flip a random
+    cell inside each colliding window, repeat until **zero** duplicates. Same
+    window-uniqueness guarantee as the algebraic perfect-map constructions but
+    for arbitrary sizes. The pattern is reproducible from ``seed``.
+
+    Defaults: 4 px cells -> 480x270 grid; 5x5-cell windows -> 2^25 code space
+    for ~125k windows (a 20x20 px spatial decoding footprint).
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    gw, gh = width // cell, height // cell
+    rng = np.random.default_rng(seed)
+    g = rng.integers(0, 2, (gh, gw), dtype=np.uint8)
+    weights = (1 << np.arange(win * win, dtype=np.int64)).reshape(win, win)
+    for it in range(200):
+        codes = np.einsum("ijkl,kl->ij",
+                          sliding_window_view(g, (win, win)).astype(np.int64),
+                          weights)
+        flat = codes.ravel()
+        order = np.argsort(flat, kind="stable")
+        dup = np.zeros(flat.size, bool)
+        dup[order] = np.concatenate([[False], flat[order][1:] == flat[order][:-1]])
+        if not dup.any():
+            break
+        for y, x in zip(*np.divmod(np.flatnonzero(dup), codes.shape[1])):
+            dy, dx = rng.integers(0, win, 2)
+            g[y + dy, x + dx] ^= 1
+    else:
+        raise RuntimeError("marray window-uniqueness repair did not converge")
+    print(f"  marray: {gw}x{gh} cells of {cell}px, {win}x{win} windows unique "
+          f"({codes.size} windows / 2^{win * win} codes, {it} repair rounds)")
+    img = np.zeros((height, width))
+    up = np.kron(g, np.ones((cell, cell), np.uint8)).astype(float)
+    img[:up.shape[0], :up.shape[1]] = up[:height, :width]
+    return img[None]  # (1, H, W)
+
+
+def _speckle(width: int, height: int, sigma_px: float = 1.5,
+             seed: int = 0) -> np.ndarray:
+    """Single band-limited noise frame (DIC-style speckle) for NCC matching.
+
+    White noise low-pass filtered (Gaussian, in Fourier space) to a feature
+    size of ~``sigma_px`` pixels, then percentile-stretched to [0, 1] — the
+    correlation-matching complement to the discrete ``marray`` code.
+    """
+    rng = np.random.default_rng(seed)
+    n = rng.normal(size=(height, width))
+    fy = np.fft.fftfreq(height)[:, None]
+    fx = np.fft.rfftfreq(width)[None, :]
+    lp = np.exp(-2 * (np.pi * sigma_px) ** 2 * (fx ** 2 + fy ** 2))
+    img = np.fft.irfft2(np.fft.rfft2(n) * lp, s=(height, width))
+    lo, hi = np.percentile(img, [1, 99])
+    return np.clip((img - lo) / (hi - lo), 0, 1)[None]  # (1, H, W)
+
+
+MONO_BUILDERS = {"marray": _marray, "speckle": _speckle}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--methods", nargs="+",
-                    default=["graycode", "phaseshift", "rainbow", "rgb_phase", "colors"],
+                    default=["graycode", "phaseshift", "rainbow", "rgb_phase", "colors",
+                             "marray", "speckle"],
                     help=f"strategies to materialise; available: "
-                         f"{sorted(REGISTRY)} + {sorted(COLOR_BUILDERS)}")
+                         f"{sorted(REGISTRY)} + {sorted(COLOR_BUILDERS)} + {sorted(MONO_BUILDERS)}")
     ap.add_argument("--width", type=int, default=1920, help="pattern width (projector columns)")
     ap.add_argument("--height", type=int, default=1080, help="pattern height (projector rows)")
     ap.add_argument("--out", default="patterns", help="root folder for the pattern sets")
@@ -90,6 +157,8 @@ def main() -> None:
     for name in args.methods:
         if name in COLOR_BUILDERS:
             pats, kind = COLOR_BUILDERS[name](args.width, args.height), "rgb "
+        elif name in MONO_BUILDERS:
+            pats, kind = MONO_BUILDERS[name](args.width, args.height), "gray"
         else:
             pats, kind = build_method(name).patterns(args.width, args.height), "gray"
         sdir = io.ensure_dir(os.path.join(args.out, name))
