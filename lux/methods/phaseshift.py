@@ -57,8 +57,17 @@ class PhaseShiftMethod(Method):
         stack += _shifted_sines(width, height, 1, self.shifts)
         return np.stack(stack, axis=0)
 
-    def decode(self, images: np.ndarray, rig: Rig) -> DepthResult:
-        width = rig.projector.width
+    def fringe_phase(self, images: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """High-frequency wrapped phase [0, 2pi) + modulation amplitude — the
+        sub-pixel within-fringe position. Pair with an external integer fringe
+        index (e.g. a Gray-code column) for robust *Gray-coded* phase shifting,
+        which avoids this method's own fragile unit-frequency unwrap."""
+        return _demodulate(images[: self.shifts])
+
+    def decode_columns(self, images: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
+        """Sub-pixel projector column per pixel via dual-frequency phase shift,
+        *without* a rig — returns (proj_col, amplitude), NaN where unlit/out of
+        range. ``decode`` builds on this."""
         hi = images[: self.shifts]
         lo = images[self.shifts : 2 * self.shifts]
 
@@ -75,7 +84,9 @@ class PhaseShiftMethod(Method):
 
         amplitude = np.minimum(amp_hi, amp_lo)
         lit = (amplitude > 0.05) & np.isfinite(proj_col) & (proj_col >= 0) & (proj_col < width)
-        proj_col = np.where(lit, proj_col, np.nan)
+        return np.where(lit, proj_col, np.nan), np.clip(amplitude, 0, 1)
 
-        depth = self.triangulate(rig, proj_col, valid=lit)
-        return DepthResult(depth=depth, proj_col=proj_col, confidence=np.clip(amplitude, 0, 1))
+    def decode(self, images: np.ndarray, rig: Rig) -> DepthResult:
+        proj_col, amplitude = self.decode_columns(images, rig.projector.width)
+        depth = self.triangulate(rig, proj_col, valid=np.isfinite(proj_col))
+        return DepthResult(depth=depth, proj_col=proj_col, confidence=amplitude)

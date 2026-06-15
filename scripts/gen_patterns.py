@@ -142,13 +142,26 @@ def _speckle(width: int, height: int, sigma_px: float = 1.5,
 MONO_BUILDERS = {"marray": _marray, "speckle": _speckle}
 
 
+# --------------------------------------------------------------------------
+# Horizontal Gray code: the same method, transposed -> encodes projector ROW.
+# Paired with the vertical "graycode" set it yields an exact per-pixel
+# (column, row) correspondence (decode_columns + decode_rows).
+# --------------------------------------------------------------------------
+def _graycode_h(width: int, height: int) -> np.ndarray:
+    return build_method("graycode").patterns(width, height, axis="y")
+
+
+AXIS_BUILDERS = {"graycode_h": _graycode_h}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--methods", nargs="+",
-                    default=["graycode", "phaseshift", "rainbow", "rgb_phase", "colors",
-                             "marray", "speckle"],
+                    default=["graycode", "graycode_h", "phaseshift", "rainbow",
+                             "rgb_phase", "colors", "marray", "speckle"],
                     help=f"strategies to materialise; available: "
-                         f"{sorted(REGISTRY)} + {sorted(COLOR_BUILDERS)} + {sorted(MONO_BUILDERS)}")
+                         f"{sorted(REGISTRY)} + {sorted(COLOR_BUILDERS)} + "
+                         f"{sorted(MONO_BUILDERS)} + {sorted(AXIS_BUILDERS)}")
     ap.add_argument("--width", type=int, default=1920, help="pattern width (projector columns)")
     ap.add_argument("--height", type=int, default=1080, help="pattern height (projector rows)")
     ap.add_argument("--out", default="patterns", help="root folder for the pattern sets")
@@ -159,6 +172,8 @@ def main() -> None:
             pats, kind = COLOR_BUILDERS[name](args.width, args.height), "rgb "
         elif name in MONO_BUILDERS:
             pats, kind = MONO_BUILDERS[name](args.width, args.height), "gray"
+        elif name in AXIS_BUILDERS:
+            pats, kind = AXIS_BUILDERS[name](args.width, args.height), "gray"
         else:
             pats, kind = build_method(name).patterns(args.width, args.height), "gray"
         sdir = io.ensure_dir(os.path.join(args.out, name))

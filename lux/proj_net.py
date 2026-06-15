@@ -167,14 +167,36 @@ class ProjUNet(nn.Module):
 # --------------------------------------------------------------------------
 # Loss
 # --------------------------------------------------------------------------
+def _focal_ce(logits: torch.Tensor, target_idx: torch.Tensor, m: torch.Tensor,
+              gamma: float) -> torch.Tensor:
+    """Masked, summed bin cross-entropy. ``gamma>0`` makes it *focal*: each
+    pixel's CE is scaled by ``(1-p_t)**gamma`` so easy, already-correct bins
+    contribute little and gradient concentrates on the hard ones (here, the
+    edge / bottom-row v-bins the net keeps missing). The focal weights are
+    detached and renormalised to mean 1 over the valid pixels, so the CE term
+    keeps its plain-CE magnitude — it only *redistributes* emphasis, leaving the
+    balance against the offset/validity terms unchanged. ``gamma=0`` is plain CE."""
+    ce_px = F.cross_entropy(logits, target_idx, reduction="none")
+    if gamma > 0:
+        pt = torch.exp(-ce_px.detach()).clamp(max=1.0)   # prob of the true bin
+        w = (1.0 - pt).pow(gamma)
+        w = w * (m.sum().clamp(min=1.0) / (w * m).sum().clamp(min=1e-6))
+        ce_px = w * ce_px
+    return (ce_px * m).sum()
+
+
 def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
-              proj_wh: tuple[int, int], offset_weight: float = 2.0):
+              proj_wh: tuple[int, int], offset_weight: float = 2.0,
+              focal_gamma: float = 0.0, v_weight: float = 1.0):
     """Classification + offset loss, masked to valid pixels.
 
     Per axis: cross-entropy over the coarse bins + L1 on the within-bin
     fraction (supervised at the GT bin), plus BCE on the validity logit.
     ``target`` is (B, 2, H, W) normalized coords (invalid filled with 0),
     ``valid`` (B, 1, H, W) float {0, 1}.
+    ``focal_gamma`` (>0) focuses the bin CE on hard pixels (see :func:`_focal_ce`);
+    ``v_weight`` scales the row (v) CE relative to the column (u) CE — v is the
+    lagging axis (its deficit is concentrated in the edge / bottom-row bins).
     Returns (total, decoded_px_l1, bce, u_bin_acc) for logging.
     """
     nu, nv = N_BINS_U, N_BINS_V
@@ -188,8 +210,8 @@ def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
     iu, iv = tu.long(), tv.long()
     fu, fv = tu - iu, tv - iv                            # within-bin fraction
 
-    ce = (F.cross_entropy(lu, iu, reduction="none") * m).sum() / nvalid \
-        + (F.cross_entropy(lv, iv, reduction="none") * m).sum() / nvalid
+    ce = (_focal_ce(lu, iu, m, focal_gamma)
+          + v_weight * _focal_ce(lv, iv, m, focal_gamma)) / nvalid
     off_l1 = ((off[:, 0] - fu).abs() * m).sum() / nvalid \
         + ((off[:, 1] - fv).abs() * m).sum() / nvalid
     bce = F.binary_cross_entropy_with_logits(pred[:, -1], m)
@@ -206,6 +228,49 @@ def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
 # --------------------------------------------------------------------------
 # Dataset
 # --------------------------------------------------------------------------
+def _gaussian_blur(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur of a 2D float image — numpy-only (runs in
+    DataLoader workers, no scipy), vectorised over kernel taps so it's cheap."""
+    r = max(1, int(round(3 * sigma)))
+    x = np.arange(-r, r + 1)
+    k = np.exp(-x * x / (2 * sigma * sigma))
+    k /= k.sum()
+    out = img
+    for ax in (0, 1):
+        pad = [(r, r) if a == ax else (0, 0) for a in range(2)]
+        p = np.pad(out, pad, mode="reflect")
+        acc = np.zeros_like(out)
+        for t, w in enumerate(k):
+            sl = [slice(None), slice(None)]
+            sl[ax] = slice(t, t + out.shape[ax])
+            acc = acc + w * p[tuple(sl)]
+        out = acc
+    return out
+
+
+def _augment_crop(ic: np.ndarray, rng) -> np.ndarray:
+    """Input-only train-time augmentation (target/validity untouched). All
+    probabilistic so sharp, clean crops still appear — otherwise blur/noise on
+    every crop would cap the subpixel ceiling. Stacks on top of the per-sample
+    render-time imperfections, re-randomised every crop/epoch: exposure
+    (gain+gamma), optical blur on a fraction, a high-contrast/highlight-clipped
+    capture regime on half (real projectors + autoexposure saturate highlights
+    that clean renders don't), additive sensor noise on most."""
+    ic = np.clip(ic * rng.uniform(0.7, 1.3), 0, 1) ** rng.uniform(0.8, 1.25)
+    if rng.random() < 0.4:                        # 4px cells survive sigma < ~1.5
+        ic = _gaussian_blur(ic, rng.uniform(0.4, 1.5))
+    if rng.random() < 0.5:
+        # High-contrast / clipped capture: stretch contrast about the crop mean
+        # and lift brightness so bright cells saturate (real captures clip ~4% of
+        # lit px vs ~0.5% in clean renders). Input-only -> correspondence unchanged;
+        # clipping is intentional so the net learns to place offsets despite it.
+        m = float(ic.mean())
+        ic = np.clip((ic - m) * rng.uniform(1.2, 2.2) + m + rng.uniform(0.0, 0.25), 0, 1)
+    if rng.random() < 0.7:
+        ic = ic + rng.normal(0.0, rng.uniform(0.005, 0.05), ic.shape)
+    return np.clip(ic, 0.0, 1.0).astype(np.float32)
+
+
 class ProjSamples(Dataset):
     """Random crops from ``renders/train``-style sample folders.
 
@@ -260,7 +325,7 @@ class ProjSamples(Dataset):
                     break
             ic = img[y:y + S, x:x + S].copy()
             if self.jitter:
-                ic = np.clip(ic * rng.uniform(0.7, 1.3), 0, 1) ** rng.uniform(0.8, 1.25)
+                ic = _augment_crop(ic, rng)
             ics.append(torch.from_numpy(ic[None]))
             tcs.append(torch.from_numpy(
                 np.nan_to_num(gt[y:y + S, x:x + S]).transpose(2, 0, 1).copy()))
@@ -362,7 +427,7 @@ class LoafSamples(Dataset):
                     break
             ic = caps[i, y:y + S, x:x + S].astype(np.float32) / 255.0
             if self.jitter:
-                ic = np.clip(ic * rng.uniform(0.7, 1.3), 0, 1) ** rng.uniform(0.8, 1.25)
+                ic = _augment_crop(ic, rng)
             tc = q.astype(np.float32) / _GT_MAX
             tc = np.where(v[..., None], tc, 0.0)
             ics.append(torch.from_numpy(ic[None]))
@@ -412,13 +477,22 @@ class ConcatLoaf(torch.utils.data.ConcatDataset):
 # --------------------------------------------------------------------------
 @torch.no_grad()
 def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
-                 device: str = "cpu", return_conf: bool = False):
+                 device: str = "cpu", return_conf: bool = False,
+                 conf_per_axis: bool = False):
     """Full-frame inference: capture (H, W) in [0,1] -> (H, W, 2) projector px,
     NaN where the validity head says the projector can't see the pixel.
 
-    ``return_conf`` also returns the u-bin softmax max-probability (H, W) — a
-    well-calibrated per-pixel confidence (conf>0.9 keeps ~50% of pixels at ~98%
-    bin accuracy); threshold it to trade coverage for outlier purity.
+    ``return_conf`` also returns a per-pixel confidence (H, W): the **joint**
+    correspondence confidence ``min(conf_u, conf_v)`` of the two bin-softmax
+    maxima — both axes must be certain for the (col, row) pair to be trusted.
+    (Gating on the *column* softmax alone is blind to row-only failures: on an
+    oblique plane the foreshortened band stays column-confident while the row
+    aliases, so a column-only confidence map reads uniformly high while the row
+    is badly wrong.) conf>0.9 keeps ~30% of pixels at ~98% bin accuracy on both
+    axes; threshold it to trade coverage for outlier purity.
+
+    ``conf_per_axis`` instead returns ``(uv, conf_u, conf_v)`` so analysis tools
+    can gate each axis on its own softmax (and form the joint min themselves).
     """
     model.eval()
     nu, nv = N_BINS_U, N_BINS_V
@@ -427,16 +501,21 @@ def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
     x = torch.from_numpy(img.astype(np.float32))[None, None]
     x = F.pad(x, (0, pw, 0, ph), mode="reflect").to(device)
     out = model(x)[0, :, :H, :W]
-    # Decode on-device: ship 2-3 result channels to the CPU, not all 99 (~840 MB).
+    # Decode on-device: ship 2-4 result channels to the CPU, not all 99 (~840 MB).
     u = (out[:nu].argmax(0).float() + out[nu + nv].clamp(0, 1)) * (proj_wh[0] / nu)
     v = (out[nu:nu + nv].argmax(0).float() + out[nu + nv + 1].clamp(0, 1)) * (proj_wh[1] / nv)
     uv = torch.stack([u, v], dim=-1)
     valid = out[-1] > 0.0                                # logit > 0 == p > 0.5
     uv = torch.where(valid[..., None], uv, torch.full_like(uv, float("nan")))
-    if return_conf:
-        conf = torch.softmax(out[:nu].float(), dim=0).max(0).values
-        return uv.float().cpu().numpy(), conf.cpu().numpy()
-    return uv.float().cpu().numpy()
+    uv = uv.float().cpu().numpy()
+    if return_conf or conf_per_axis:
+        conf_u = torch.softmax(out[:nu].float(), dim=0).max(0).values
+        conf_v = torch.softmax(out[nu:nu + nv].float(), dim=0).max(0).values
+        if conf_per_axis:
+            return uv, conf_u.cpu().numpy(), conf_v.cpu().numpy()
+        conf = torch.minimum(conf_u, conf_v)             # joint correspondence conf
+        return uv, conf.cpu().numpy()
+    return uv
 
 
 def save_checkpoint(path: str, model: ProjUNet, proj_wh, meta: dict | None = None):

@@ -54,7 +54,16 @@ class GrayCodeMethod(Method):
     def __init__(self, invert_pairs: bool = True):
         self.invert_pairs = invert_pairs  # project each pattern + its inverse
 
-    def patterns(self, width: int, height: int) -> np.ndarray:
+    def patterns(self, width: int, height: int, axis: str = "x") -> np.ndarray:
+        """``axis='x'`` (default): vertical stripes encoding the projector
+        **column**. ``axis='y'``: horizontal stripes encoding the **row** — the
+        identical temporal code rotated 90° (generate by swapping the dimensions
+        and transposing each frame; decode with ``decode_rows``). Pairing the two
+        gives an exact per-pixel (column, row) projector correspondence."""
+        if axis == "y":
+            return np.transpose(self.patterns(height, width, "x"), (0, 2, 1))
+        if axis != "x":
+            raise ValueError(f"axis must be 'x' or 'y', got {axis!r}")
         nbits = _num_bits(width)
         cols = np.arange(width)
         # Natural binary -> Gray code.
@@ -71,8 +80,12 @@ class GrayCodeMethod(Method):
         stack.append(np.zeros((height, width)))
         return np.stack(stack, axis=0)
 
-    def decode(self, images: np.ndarray, rig: Rig) -> DepthResult:
-        width = rig.projector.width
+    def decode_columns(self, images: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray]:
+        """Decode the projector column per camera pixel, *without* a rig or
+        triangulation — for real captures with no calibration. Returns
+        ``(proj_col, confidence)``: ``proj_col`` (H, W) is the decoded column,
+        NaN where unlit or out of range; ``confidence`` (H, W) in [0, 1] is the
+        worst per-bit separation (0 where unlit). ``decode`` builds on this."""
         nbits = _num_bits(width)
         H, W = images.shape[1:]
 
@@ -104,6 +117,16 @@ class GrayCodeMethod(Method):
         weights = (1 << np.arange(nbits - 1, -1, -1)).astype(np.int64)
         proj_col = (binary * weights).sum(axis=-1).astype(np.float64)
         proj_col = np.where(lit & (proj_col < width), proj_col, np.nan)
+        return proj_col, np.where(lit, confidence, 0.0)
 
+    def decode_rows(self, images: np.ndarray, height: int) -> tuple[np.ndarray, np.ndarray]:
+        """Decode the projector **row** per camera pixel from horizontal
+        (``axis='y'``) Gray-code captures. The temporal per-pixel decode is
+        identical to ``decode_columns`` (orientation-agnostic); only the
+        coordinate range differs. Returns ``(proj_row, confidence)``."""
+        return self.decode_columns(images, height)
+
+    def decode(self, images: np.ndarray, rig: Rig) -> DepthResult:
+        proj_col, confidence = self.decode_columns(images, rig.projector.width)
         depth = self.triangulate(rig, proj_col, valid=np.isfinite(proj_col))
-        return DepthResult(depth=depth, proj_col=proj_col, confidence=np.where(lit, confidence, 0.0))
+        return DepthResult(depth=depth, proj_col=proj_col, confidence=confidence)

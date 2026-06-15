@@ -49,9 +49,9 @@ Dense correspondence from one shot is what makes single-frame metric depth possi
 <p>
 <span class="pill">input 1×H×W grayscale</span>
 <span class="pill">output 99×H×W (60+36 bins, 2 offsets, validity)</span>
-<span class="pill">7.85 M params</span>
+<span class="pill">conv U-Net 7.85 M · attn variant 17 M</span>
 <span class="pill">~300 px receptive field</span>
-<span class="pill">val median |Δu| ≈ 10.5 px @ epoch 10</span>
+<span class="pill">0.59 px raw median · ~0.45 px @ 99% precision (conf-masked)</span>
 </p>
 
 <h2>1 · Why this can work one-shot: the M-array pattern</h2>
@@ -289,8 +289,15 @@ ray-caster; NaN = projector-occluded (supervises the validity head)</td></tr>
 resolution) · opened with <span class="mono">mmap</span>: a 256² crop reads ~130 KB of pages, RAM use
 independent of dataset size</td></tr>
 <tr><td>Sampling</td><td>8 random 256² crops per sample per epoch · crops resampled until ≥5% valid ·
-photometric jitter (gain 0.7–1.3, gamma 0.8–1.25) · <strong>no flips</strong> — the M-array code is
-chiral; a mirrored capture cannot occur</td></tr>
+<strong>no flips</strong> (the M-array code is chiral; a mirrored capture cannot occur)</td></tr>
+<tr><td>Crop augmentation</td><td>input-only, all probabilistic so sharp crops still appear:
+gain 0.7–1.3 + gamma 0.8–1.25, optical blur (σ≤1.5, 40%), additive noise (σ≤0.05, 70%).
+Re-randomized every crop/epoch (vs the one fixed realization baked into each render).
+NB: baked-in DoF blur at high obliquity already compresses cells — heavy crop-blur there may
+hurt; a candidate confound under review.</td></tr>
+<tr><td>Second domain</td><td><span class="mono">renders/planar_loaf</span> — planar junctions posed
+over the hemisphere (0–75° tilt), the pose coverage the clutter set lacks. Trained jointly via
+<span class="mono">ConcatLoaf</span> (mixes ~50/50, first <span class="mono">--val</span> of each held out).</td></tr>
 </table>
 
 <h2>6 · Training setup</h2>
@@ -299,10 +306,18 @@ chiral; a mirrored capture cannot occur</td></tr>
 <tr><td>Optimizer</td><td>AdamW, lr 1e-3 → cosine anneal, weight decay 1e-4</td></tr>
 <tr><td>Batch</td><td>64 crops (8 samples × 8 crops), fp16 autocast + GradScaler (MPS)</td></tr>
 <tr><td>Throughput</td><td>~46 img/s on M4 Max → ~29 min/epoch at 10k samples (GPU-bound)</td></tr>
-<tr><td>Validation</td><td>4 held-out samples, full-frame inference each epoch; checkpoint on best
-median |Δu|; warm-restart via shape-filtered weight loading (head swaps keep the encoder)</td></tr>
-<tr><td>Monitoring</td><td>TensorBoard (<span class="mono">runs/proj_net_cls</span>) ·
-<span class="mono">checkpoints/train.log</span> · <span class="mono">checkpoints/metrics.csv</span></td></tr>
+<tr><td>LR schedule</td><td>cosine with a floor (<span class="mono">--lr-min 1e-4</span>) — annealing to 0
+is wrong while a loss term (the offset) hasn't started learning yet.</td></tr>
+<tr><td>Loss weighting</td><td><span class="mono">--offset-weight</span> (raise once bins saturate), or
+<span class="mono">--gate-offset</span> self-paced curriculum that ramps the offset weight in as bin
+accuracy climbs 70→95% (offset can't learn before bins exist).</td></tr>
+<tr><td>Checkpointing</td><td><span class="mono">--snapshots</span> saves every epoch
+(<span class="mono">_epNN.pt</span>) + a rolling <span class="mono">_last.pt</span>, since the aggregate
+val median is a poor proxy for obliquity — pick the best-on-<em>hemisphere</em> checkpoint post-hoc.</td></tr>
+<tr><td>Validation</td><td>4 held-out per loaf, full-frame each epoch (median |Δu|/|Δv|, bin acc, IoU);
+warm-restart via shape-filtered weight loading (the encoder/decoder/head transfer across a mid swap).</td></tr>
+<tr><td>Monitoring</td><td>TensorBoard (<span class="mono">runs/…</span>) ·
+<span class="mono">checkpoints/*.log</span> · <span class="mono">metrics.csv</span></td></tr>
 </table>
 
 <h2>7 · Results (overnight run, 10,117 samples)</h2>
@@ -355,25 +370,70 @@ The regression baseline (not shown) plateaued at ~360 px.</figcaption>
 </figure>
 
 <table>
-<tr><th>Model</th><th>Val median |Δu|</th><th>Validity IoU</th><th>Notes</th></tr>
+<tr><th>Model / stage</th><th>Val median |Δu|</th><th>Validity IoU</th><th>Notes</th></tr>
 <tr><td>Regression head (baseline)</td><td class="num">~359 px</td><td class="num">0.62</td>
-<td>plateaued; linear improvement only</td></tr>
-<tr><td>Cls+offset head, epoch 10</td><td class="num">10.5 px</td><td class="num">0.98</td>
-<td>still improving when interrupted; p95 ≈ 400–1200 px (wrong-bin tail)</td></tr>
+<td>plateaued; linear improvement only — abandoned</td></tr>
+<tr><td>Cls+offset, epoch 10</td><td class="num">10.5 px</td><td class="num">0.98</td>
+<td>"right bin, random offset": bin acc 83%, offset corr only 0.17</td></tr>
+<tr><td>+ offset-weight 2→6 fine-tune</td><td class="num">0.59 px</td><td class="num">0.98</td>
+<td>offset corr 0.17→0.92; the subpixel breakthrough was the offset, not the bins</td></tr>
+<tr><td>&nbsp;&nbsp;…confidence-masked (conf&gt;0.9)</td><td class="num">~0.45 px</td><td class="num">—</td>
+<td>~75% coverage, <strong>99.2–99.8% bin precision</strong>, p95 collapses 1100→&lt;3 px</td></tr>
 </table>
 
-<h2>8 · Known limitations & next steps</h2>
+<p><strong>The offset was the real subpixel lever.</strong> At 10.5 px the model already had
+the right bin 83% of the time — but the within-bin offset was essentially untrained
+(predicted-vs-true fraction correlation 0.17, i.e. ≈ a random offset, which yields
+~32/3 ≈ 10.7 px). Raising the offset loss weight 2→6 once bin accuracy had saturated
+took the correlation to 0.92 and the raw median to 0.59 px. With confidence masking, the
+deployed numbers are <strong>~0.45 px median at 99%+ bin precision on ~75% of pixels</strong>
+— effectively the Gray-code 0.25 px regime, from one shot.</p>
+
+<h3>Generalization: the hemisphere obliquity benchmark</h3>
+<p><span class="mono">scripts/eval_hemisphere.py</span> sweeps a single flat plane viewed by a
+camera and projector posed <em>independently</em> across the hemisphere (obliquity 0–75°, clean
+captures) — isolating <em>pose</em> generalization. The clutter-trained model is excellent
+near head-on and falls off a <strong>cliff at ~45°</strong>:</p>
 <table>
-<tr><th>Issue</th><th>Plan</th></tr>
-<tr><td>Wrong-bin tail (p95 in the hundreds of px), concentrated in blurred / dark / oblique regions</td>
-<td>more epochs (in progress) · use bin-softmax confidence to extend the validity mask ·
-median/consistency filtering at inference</td></tr>
-<tr><td>Median 10 px ≈ ⅓ bin — offset head not yet subpixel (multi-shot Gray code reaches ~0.25 px)</td>
-<td>raise offset loss weight · soft-argmax over neighboring bins · longer training at low LR</td></tr>
-<tr><td>Synthetic-only training (Lambertian direct light, no interreflections / speculars)</td>
-<td>Mitsuba-rendered validation slice; later fine-tune on real captures</td></tr>
-<tr><td>Single fixed pattern (codebook memorized in weights)</td>
-<td>by design for deployment; correlation/RAFT-style matching is the pattern-agnostic upgrade path</td></tr>
+<tr><th>max(cam,proj) obliquity</th><th>u-bin acc</th><th>median |Δu|</th><th>median |Δu| in correct bins</th></tr>
+<tr><td>0–15°</td><td class="num">96%</td><td class="num">0.56 px</td><td class="num">0.54 px</td></tr>
+<tr><td>15–30°</td><td class="num">95%</td><td class="num">0.49 px</td><td class="num">0.46 px</td></tr>
+<tr><td>30–45°</td><td class="num">82%</td><td class="num">1.0 px</td><td class="num">0.77 px</td></tr>
+<tr><td>45–60°</td><td class="num">46%</td><td class="num">27 px</td><td class="num">1.6 px</td></tr>
+<tr><td>60–75°</td><td class="num">4%</td><td class="num">379 px</td><td class="num">7.4 px</td></tr>
+</table>
+<p>Two findings drive the next phase of work. <strong>(1) The offset head is pose-invariant</strong>
+— the "in correct bins" column stays ~sub-pixel even at 45–60° — so the entire failure is
+<em>bin misclassification</em> at obliquity, not the offset. <strong>(2) The cliff sits exactly at
+the training distribution's edge</strong> (clutter rigs are near-frontal). It's a <em>support hole</em>,
+not a density problem: more epochs/samples of the same near-frontal data don't move it.
+The fix is training data with hemisphere pose coverage — see §8. (The four-panel
+<span class="mono">hemisphere_overview.png</span>: top-down camera & projector pose disks sized by
+error, an error-vs-deflection trace, and a camera×projector heatmap showing the L-shaped
+failure region — error is high whenever <em>either</em> device grazes.)</p>
+
+<h2>8 · Status, limitations & next steps</h2>
+<table>
+<tr><th>Item</th><th>Status / plan</th></tr>
+<tr><td>Subpixel offset</td><td><strong>Done</strong> — offset-weight 2→6 took median to 0.59 px (corr 0.92).</td></tr>
+<tr><td>Wrong-bin p95 tail</td><td><strong>Done at inference</strong> — bin-softmax confidence masking
+(<span class="mono">predict_proj_net.py --min-conf</span>): conf&gt;0.9 → ~99% precision, p95 1100→&lt;3 px.</td></tr>
+<tr><td><strong>Obliquity cliff at ~45°</strong> (the open problem)</td>
+<td>Support hole — needs hemisphere-pose training data. Built
+<span class="mono">gen_planar_dataset.py</span> (planar junctions over the hemisphere, 0–75° tilt) →
+<span class="mono">renders/planar_loaf</span>; train on both loaves via <span class="mono">ConcatLoaf</span>
+(<span class="mono">--loaf val_loaf planar_loaf</span>). Warm-start mixed run in progress; cliff not
+moving by epoch ~5 → likely warm-start entrenchment → <strong>from-scratch on both loaves</strong>
+is the next experiment (see <span class="mono">docs/plan_train_from_scratch.md</span>).</td></tr>
+<tr><td>60–75° extreme obliquity</td><td>Probably an <em>information limit</em> — cells anamorphically
+compressed below resolvability. Expected to remain poor; report + confidence-mask rather than chase.</td></tr>
+<tr><td>Architecture ceiling on hard regions</td><td>Transformer-bottleneck variant (<span class="mono">--mid attn</span>)
+tests whether global context helps oblique/ambiguous regions a conv RF can't reach — see §10.</td></tr>
+<tr><td>Synthetic-only (Lambertian, no interreflections/speculars)</td>
+<td>Real-world eval via the capture app (<span class="mono">docs/plan_capture_app.md</span>); then
+real-data fine-tune (sim-to-real).</td></tr>
+<tr><td>Self-calibration from the c2d map</td><td>Designed (<span class="mono">docs/calibration_design.md</span>),
+not built — recover rig intrinsics+pose from the dense correspondence, up to scale.</td></tr>
 </table>
 
 <h2>9 · Reproduce</h2>
@@ -390,6 +450,86 @@ python scripts/train_proj_net.py --loaf renders/val_loaf --epochs 25 --batch 64 
 
 # inference + scoring on any sample folder
 python scripts/predict_proj_net.py renders/val/sample_100000</pre>
+
+<h2>10 · Attention bottleneck variant (<span class="mono">--mid attn</span>)</h2>
+<p>The conv U-Net's reach is a fixed ~300 px receptive field. The hypothesis: the
+obliquity/ambiguity failures are partly a <em>context</em> problem — a foreshortened or
+blurred patch can't disambiguate its code from local evidence alone, but could borrow
+evidence from sharper regions elsewhere in the frame. A conv can't do that; <strong>global
+self-attention can.</strong> So the variant swaps <em>only the bottleneck</em>, leaving the
+encoder, decoder, skips, and head identical — which keeps it warm-start-compatible with any
+conv checkpoint (shape-filtered loading copies everything but the mid).</p>
+
+<figure>
+<svg viewBox="0 0 900 200" width="100%">
+  <g font-size="11.5" fill="#d8e1ea" text-anchor="middle">
+    <rect x="20" y="70" width="150" height="56" rx="6" fill="#1d2935" stroke="#4fc3f7"/>
+    <text x="95" y="94">encoder out</text>
+    <text x="95" y="111" fill="#8b9bab">256 ch · 16×16</text>
+
+    <rect x="200" y="70" width="120" height="56" rx="6" fill="#26203a" stroke="#b388ff"/>
+    <text x="260" y="92">1×1 → 512</text>
+    <text x="260" y="109" fill="#8b9bab">+ 2D sin-cos PE</text>
+
+    <rect x="350" y="55" width="320" height="86" rx="6" fill="#26203a" stroke="#b388ff"/>
+    <text x="510" y="78">4 × transformer block</text>
+    <text x="510" y="98" fill="#8b9bab">LN → MHSA (8 heads) → LN → MLP 512·4</text>
+    <text x="510" y="117" fill="#8b9bab">tokens = H/16 · W/16 (256 @ crop, ~8160 full-frame)</text>
+
+    <rect x="700" y="70" width="150" height="56" rx="6" fill="#1d2935" stroke="#69f0ae"/>
+    <text x="775" y="94">→ decoder</text>
+    <text x="775" y="111" fill="#8b9bab">512 ch · 16×16</text>
+
+    <line x1="170" y1="98" x2="198" y2="98" stroke="#8b9bab" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <line x1="320" y1="98" x2="348" y2="98" stroke="#8b9bab" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <line x1="670" y1="98" x2="698" y2="98" stroke="#8b9bab" stroke-width="1.5" marker-end="url(#arr2)"/>
+    <text x="450" y="175" fill="#8b9bab" font-size="11">conv mid = Block(256→512) · attn mid = TransformerMid (same I/O shape, drop-in)</text>
+  </g>
+</svg>
+<figcaption><span class="mono">TransformerMid</span>: global attention over the 1/16-resolution
+grid. Same input/output shape as the conv block, so it's a drop-in swap.</figcaption>
+</figure>
+
+<table>
+<tr><th></th><th>conv mid</th><th>attn mid</th></tr>
+<tr><td>params</td><td class="num">7.85 M</td><td class="num">17.06 M</td></tr>
+<tr><td>FLOPs (full frame)</td><td class="num">900 GF</td><td class="num">1527 GF</td></tr>
+<tr><td>inference (1080p, MPS)</td><td class="num">~480 ms</td><td class="num">~1040 ms</td></tr>
+</table>
+<p class="dim">The attention cost is quadratic in tokens and bites only at full-frame inference
+(~8160 tokens); at the 256² training crop it's just 256 tokens, so training is cheap. ~545 GF
+of the extra cost is the N² attention matrices alone.</p>
+
+<h3>First result (run on a separate machine, "barnacle")</h3>
+<p>Warm-started from the conv checkpoint and trained with the new attention mid, it reached
+<strong>~1 px precision almost immediately.</strong> Encouraging — but read it carefully:</p>
+<ul>
+<li><strong>What it does establish:</strong> the transformer bottleneck integrates into the
+warm-started model <em>cleanly and stably</em> — a fresh, randomly-initialized attention block
+dropped into a trained net didn't disrupt it (the full-res skips keep the model functional while
+the mid learns), and it converges fast. The architecture is viable and trainable.</li>
+<li><strong>What it does <em>not</em> yet establish:</strong> superiority over conv. The ~1 px is
+largely <em>inherited from the warm start</em> (the head already does subpixel offset, the
+encoder/decoder already read the code) and is measured on the easy-pixel-dominated aggregate
+median — where the conv warm-start sits at ~0.6 px too. So "immediate 1 px" means "didn't break,
+trained fast," not "beats the conv."</li>
+<li><strong>The decisive test is the hemisphere bench, not the median.</strong> Attention's
+hypothesized edge is exactly the oblique/ambiguous bands (45–75°) where the conv cliffs. That
+comparison hasn't been run on the attn checkpoint yet — and it's the one number that would make
+this promising-vs-not.</li>
+</ul>
+
+<h3>Next steps for the attention variant</h3>
+<ol>
+<li>Run <span class="mono">eval_hemisphere.py --ckpt &lt;attn ckpt&gt;</span> and compare the 45–75°
+bands head-to-head with the conv baseline. <em>This is the make-or-break measurement.</em></li>
+<li>Train the attn variant on <strong>both loaves</strong> (clutter + planar) and re-bench — if
+global context helps the cliff, this is where it shows.</li>
+<li>Consider attn <strong>from scratch</strong> (not warm-started) to remove the conv-checkpoint
+confound and see its true convergence behavior.</li>
+<li>If it wins on obliquity but the 2× inference cost matters for deployment: a windowed/linear
+attention, or attention only at the coarsest level, to recover speed.</li>
+</ol>
 
 </body>
 </html>

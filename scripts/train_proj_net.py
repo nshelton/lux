@@ -114,6 +114,12 @@ def main() -> None:
                          "as train bin accuracy rises from 70%% to 95%% — the micro "
                          "task (offset) earns gradient share as its prerequisite "
                          "(bin classification) is met; 0 disables")
+    ap.add_argument("--focal-gamma", type=float, default=0.0,
+                    help="focal-loss gamma on the bin CE (>0 focuses gradient on "
+                         "hard bins, e.g. the edge/bottom-row v-bins; 0 = plain CE)")
+    ap.add_argument("--v-weight", type=float, default=1.0,
+                    help="scale the row (v) bin CE relative to the column (u) CE; "
+                         ">1 pushes the lagging row axis")
     ap.add_argument("--base", type=int, default=32, help="U-Net width multiplier")
     ap.add_argument("--mid", choices=["conv", "attn"], default="conv",
                     help="bottleneck: conv block or transformer (global attention at 1/16)")
@@ -125,6 +131,10 @@ def main() -> None:
     ap.add_argument("--out", default="checkpoints/proj_net.pt")
     ap.add_argument("--resume", default=None,
                     help="checkpoint to warm-start the weights from")
+    ap.add_argument("--snapshots", action="store_true",
+                    help="save a checkpoint every epoch (<out>_ep<NN>.pt) plus a rolling "
+                         "<out>_last.pt — lets you pick the best-on-hemisphere checkpoint "
+                         "post-hoc instead of trusting the aggregate val metric")
     ap.add_argument("--log-every", type=int, default=20,
                     help="steps between intra-epoch log lines / TB points")
     ap.add_argument("--logdir", default="runs/proj_net",
@@ -218,7 +228,9 @@ def main() -> None:
                                   for t in (img, target, valid))
             with torch.autocast(args.device, dtype=torch.float16, enabled=args.amp):
                 loss, l1_px, _, bin_acc = proj_loss(model(img), target, valid, ds.proj_wh,
-                                                    offset_weight=off_w)
+                                                    offset_weight=off_w,
+                                                    focal_gamma=args.focal_gamma,
+                                                    v_weight=args.v_weight)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -251,13 +263,24 @@ def main() -> None:
         log_scalar("val/bin_acc", vbin, gstep, ep)
         log_scalar("train/lr", sched.get_last_lr()[0], gstep, ep)
         n = len(loader)
+        meta = {"epoch": ep, "val_median_du_px": med, "val_median_dv_px": medv,
+                "val_bin_acc": vbin, "val_iou": iou,
+                "pattern_set": args.pattern_set, "base": args.base}
         flag = ""
         if med < best:
             best = med
-            save_checkpoint(args.out, model, ds.proj_wh,
-                            meta={"epoch": ep, "val_median_du_px": med,
-                                  "pattern_set": args.pattern_set, "base": args.base})
-            flag = "  *saved*"
+            save_checkpoint(args.out, model, ds.proj_wh, meta=meta)
+            flag = "  *best*"
+        if args.snapshots:
+            # one checkpoint per epoch (pick best-on-hemisphere post-hoc, since the
+            # aggregate val median is a poor proxy for obliquity) + a rolling _last
+            # so the chained final eval always hits the fully-trained model.
+            stem = Path(args.out)
+            save_checkpoint(str(stem.with_name(f"{stem.stem}_ep{ep:02d}.pt")),
+                            model, ds.proj_wh, meta=meta)
+            save_checkpoint(str(stem.with_name(f"{stem.stem}_last.pt")),
+                            model, ds.proj_wh, meta=meta)
+            flag += " +snap"
         print(f"epoch {ep:3d}  loss {tot / n:7.4f}  train|du| {l1s / n:7.2f}px  "
               f"val median|du| {med:7.2f}px |dv| {medv:7.2f}px  bin {vbin * 100:.1f}%  "
               f"valid-IoU {iou:.3f}  ({time.time() - t0:.1f}s){flag}", flush=True)

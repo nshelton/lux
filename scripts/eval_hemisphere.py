@@ -48,6 +48,131 @@ def eval_sample(model, proj_wh, d: Path, device: str, pattern_set: str, frame: s
     return out
 
 
+def _disk(ax, theta, phi_deg, err, norm, title):
+    """Top-down hemisphere disk: each device pose at radius=tilt-off-normal,
+    angle=azimuth (centre = head-on, rings every 15deg out to grazing). Marker
+    size and colour both encode error, so failure regions read as big red blobs."""
+    import matplotlib.pyplot as plt
+    th = np.asarray(theta, float)
+    ph = np.radians(np.asarray(phi_deg, float))
+    x, y = th * np.cos(ph), th * np.sin(ph)
+    e = np.clip(np.asarray(err, float), norm.vmin, norm.vmax)
+    s = 18 + 260 * (np.log10(e) - np.log10(norm.vmin)) / (np.log10(norm.vmax) - np.log10(norm.vmin))
+    sc = ax.scatter(x, y, c=e, s=s, cmap="RdYlGn_r", norm=norm,
+                    edgecolors="k", linewidths=0.3, alpha=0.85, zorder=3)
+    for r in (15, 30, 45, 60, 75):
+        ax.add_patch(plt.Circle((0, 0), r, fill=False, ls=":", ec="0.6", lw=0.8, zorder=1))
+        ax.text(0, r, f"{r}°", fontsize=7, ha="center", va="bottom", color="0.5")
+    ax.set_aspect("equal")
+    ax.set_xlim(-82, 82)
+    ax.set_ylim(-82, 82)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title)
+    return sc
+
+
+def _heatmap_camproj(ax, tc, tp, err, norm):
+    """Binned median error over (camera tilt × projector tilt). Disambiguates the
+    per-device disks: failure shows as an L (bad whenever *either* device grazes),
+    with the only green region in the bottom-left (both near head-on)."""
+    edges = np.arange(0, 81, 10)
+    nb = len(edges) - 1
+    grid = np.full((nb, nb), np.nan)            # [proj_bin, cam_bin]
+    for i in range(nb):
+        for j in range(nb):
+            m = ((tc >= edges[j]) & (tc < edges[j + 1])
+                 & (tp >= edges[i]) & (tp < edges[i + 1]))
+            if m.any():
+                grid[i, j] = np.nanmedian(err[m])
+    import matplotlib as mpl
+    cmap = mpl.colormaps["RdYlGn_r"].copy()
+    cmap.set_bad("0.85")                          # empty bins -> light gray
+    im = ax.imshow(grid, origin="lower", extent=[0, 80, 0, 80], aspect="equal",
+                   cmap=cmap, norm=norm)
+    ax.set_xlabel("camera tilt off normal (°)")
+    ax.set_ylabel("projector tilt off normal (°)")
+    ax.set_title("error vs (camera × projector) tilt")
+    return im
+
+
+def plot_hemisphere(rows: list[dict], out_dir: Path, ckpt_name: str) -> None:
+    """Four readable views: top-down camera & projector pose disks (size+colour =
+    error), error vs deflection magnitude (azimuth collapsed), and a binned
+    camera×projector heatmap that disambiguates which device drives failure."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+    except ImportError:
+        print("\n(matplotlib not installed - skipped plot)")
+        return
+
+    err = np.array([r["med_du"] for r in rows], float)
+    tc = np.array([r["theta_cam_deg"] for r in rows], float)
+    tp = np.array([r["theta_proj_deg"] for r in rows], float)
+    pc = np.array([r.get("phi_cam_deg", 0.0) for r in rows], float)
+    pp = np.array([r.get("phi_proj_deg", 0.0) for r in rows], float)
+    vmax = float(max(100.0, np.nanmax(err)))
+    norm = mcolors.LogNorm(vmin=0.3, vmax=vmax)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 12))
+    sc = _disk(axes[0, 0], tc, pc, err, norm, "camera pose (top-down hemisphere)")
+    _disk(axes[0, 1], tp, pp, err, norm, "projector pose (top-down hemisphere)")
+    cb = fig.colorbar(sc, ax=axes[0, :], label="median |du| (px)", fraction=0.046, pad=0.02)
+    cb.ax.text(0.5, 1.02, "size also = error", transform=cb.ax.transAxes,
+               fontsize=7, ha="center", color="0.4")
+
+    # Error vs deflection magnitude (max device tilt off normal), azimuth collapsed.
+    defl = np.maximum(tc, tp)
+    ax = axes[1, 0]
+    ax.scatter(defl, err, s=14, alpha=0.35, color="0.45", zorder=2)
+    edges = np.arange(0, 91, 10)
+    cen, med, q1, q3 = [], [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = (defl >= a) & (defl < b)
+        if m.any():
+            cen.append((a + b) / 2)
+            med.append(np.nanmedian(err[m]))
+            q1.append(np.nanpercentile(err[m], 25))
+            q3.append(np.nanpercentile(err[m], 75))
+    ax.fill_between(cen, q1, q3, color="C3", alpha=0.18, zorder=1, label="IQR")
+    ax.plot(cen, med, "-o", color="C3", lw=2, zorder=3, label="median per 10° bin")
+    ax.axhline(1.0, ls="--", lw=0.8, color="0.5", zorder=1)
+    ax.text(2, 1.05, "1 px", fontsize=7, color="0.5")
+    ax.set_yscale("log")
+    ax.set_xlim(0, 80)
+    ax.set_xlabel("deflection = max(camera, projector) tilt off normal (°)")
+    ax.set_ylabel("median |du| (px, log)")
+    ax.set_title("error vs deflection magnitude")
+    ax.legend(fontsize=8)
+
+    im = _heatmap_camproj(axes[1, 1], tc, tp, err, norm)
+    fig.colorbar(im, ax=axes[1, 1], label="median |du| (px)", fraction=0.046, pad=0.02)
+
+    fig.suptitle(f"{ckpt_name} - hemisphere flat-plane sweep ({len(rows)} samples)")
+    fig.savefig(out_dir / "hemisphere_overview.png", dpi=130, bbox_inches="tight")
+    print(f"\nplot -> {out_dir}/hemisphere_overview.png")
+
+
+def _load_rows_csv(out_dir: Path, data_dir: Path) -> list[dict]:
+    """Read a per_sample.csv back into rows for --replot, pulling phi angles from
+    each sample's sample.json when the csv predates the phi columns."""
+    import csv
+    rows = []
+    with open(out_dir / "per_sample.csv") as f:
+        for r in csv.DictReader(f):
+            row = {k: (float(v) if v not in ("", "name") and k != "name" else v)
+                   for k, v in r.items()}
+            if "phi_cam_deg" not in row or row.get("phi_cam_deg") in (None, ""):
+                pose = json.loads((data_dir / row["name"] / "sample.json").read_text())
+                row["phi_cam_deg"] = pose.get("phi_cam_deg", 0.0)
+                row["phi_proj_deg"] = pose.get("phi_proj_deg", 0.0)
+            rows.append(row)
+    return rows
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default="evals/hemisphere/data")
@@ -56,7 +181,16 @@ def main() -> None:
     ap.add_argument("--frame", default="cap_pat_00.png")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None, help="results dir (default <data>/../results_<ckpt-stem>)")
+    ap.add_argument("--replot", action="store_true",
+                    help="skip inference; re-draw plots from an existing per_sample.csv "
+                         "(fast iteration on the figure design)")
     args = ap.parse_args()
+
+    if args.replot:
+        out_dir = Path(args.out or Path(args.data).parent / f"results_{Path(args.ckpt).stem}")
+        rows = _load_rows_csv(out_dir, Path(args.data))
+        plot_hemisphere(rows, out_dir, Path(args.ckpt).name)
+        return
 
     if args.device is None:
         import torch
@@ -78,7 +212,8 @@ def main() -> None:
         if (i + 1) % 20 == 0:
             print(f"  {i + 1}/{len(dirs)} evaluated", flush=True)
 
-    keys = ["name", "theta_cam_deg", "theta_proj_deg", "r_cam_m", "r_proj_m",
+    keys = ["name", "theta_cam_deg", "theta_proj_deg", "phi_cam_deg", "phi_proj_deg",
+            "r_cam_m", "r_proj_m",
             "bin_acc", "med_du", "med_du_correct", "p95_du", "iou", "valid_px"]
     with open(out_dir / "per_sample.csv", "w") as f:
         f.write(",".join(keys) + "\n")
@@ -103,30 +238,7 @@ def main() -> None:
               f"{agg('med_du'):7.2f}px {agg('med_du_correct'):10.2f}px "
               f"{agg('p95_du'):7.1f}px {agg('iou'):6.3f}")
 
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-        tp = [r["theta_proj_deg"] for r in rows]
-        tc = [r["theta_cam_deg"] for r in rows]
-        ba = [r["bin_acc"] * 100 for r in rows]
-        sc = axes[0].scatter(tp, ba, c=tc, cmap="viridis", s=18)
-        axes[0].set_xlabel("projector obliquity (deg)")
-        axes[0].set_ylabel("u-bin accuracy (%)")
-        fig.colorbar(sc, ax=axes[0], label="camera obliquity (deg)")
-        md = [r["med_du"] for r in rows]
-        sc2 = axes[1].scatter(tp, md, c=tc, cmap="viridis", s=18)
-        axes[1].set_yscale("log")
-        axes[1].set_xlabel("projector obliquity (deg)")
-        axes[1].set_ylabel("median |du| (px, log)")
-        fig.colorbar(sc2, ax=axes[1], label="camera obliquity (deg)")
-        fig.suptitle(f"{Path(args.ckpt).name} — hemisphere flat-plane sweep")
-        fig.tight_layout()
-        fig.savefig(out_dir / "obliquity_sweep.png", dpi=130)
-        print(f"\nplot -> {out_dir}/obliquity_sweep.png")
-    except ImportError:
-        print("\n(matplotlib not installed — skipped plot)")
+    plot_hemisphere(rows, out_dir, Path(args.ckpt).name)
     print(f"per-sample csv -> {out_dir}/per_sample.csv")
 
 

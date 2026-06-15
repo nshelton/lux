@@ -40,6 +40,22 @@ def proj_to_rgb(gt_proj: np.ndarray, proj_width: int, proj_height: int) -> np.nd
     return rgb
 
 
+def uv_conf_to_rgb(uv: np.ndarray, conf: np.ndarray,
+                   proj_width: int, proj_height: int) -> np.ndarray:
+    """Quick-look RGB of a predicted correspondence + confidence:
+    R = column (x) / proj_width, G = row (y) / proj_height, B = confidence in [0,1].
+    Invalid pixels (NaN in ``uv``) are black. (Distinct from ``proj_to_rgb``, which
+    encodes R=row, G=col, B=binary-valid.)
+    """
+    valid = np.isfinite(uv[..., 0]) & np.isfinite(uv[..., 1])
+    rgb = np.zeros(uv.shape[:2] + (3,), dtype=np.float64)
+    rgb[..., 0] = np.clip(np.nan_to_num(uv[..., 0]) / proj_width, 0, 1)    # x/col -> red
+    rgb[..., 1] = np.clip(np.nan_to_num(uv[..., 1]) / proj_height, 0, 1)   # y/row -> green
+    rgb[..., 2] = np.clip(np.nan_to_num(conf), 0, 1)                       # confidence -> blue
+    rgb[~valid] = 0.0
+    return rgb
+
+
 def load_image(path: str, gray: bool = True) -> np.ndarray:
     """Read a PNG/JPG into a float image in [0, 1]; grayscale (H, W) by default."""
     flag = cv2.IMREAD_GRAYSCALE if gray else cv2.IMREAD_COLOR
