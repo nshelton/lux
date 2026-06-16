@@ -23,13 +23,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 
 from lux import io  # noqa: E402
-from lux.proj_net import load_checkpoint, predict_full, N_BINS_U  # noqa: E402
+from lux.proj_net import load_checkpoint, predict_full, predict_tiled, N_BINS_U  # noqa: E402
 
 
-def eval_sample(model, proj_wh, d: Path, device: str, pattern_set: str, frame: str) -> dict:
+def eval_sample(model, proj_wh, d: Path, device: str, pattern_set: str, frame: str,
+                tiled: bool = False, overlap: int = 0) -> dict:
     img = io.load_image(str(d / pattern_set / frame), gray=True)
     gt = np.load(d / "gt_proj.npy")
-    pred = predict_full(model, img, proj_wh, device=device)
+    if tiled:
+        pred = predict_tiled(model, img, proj_wh, device=device, overlap=overlap)
+    else:
+        pred = predict_full(model, img, proj_wh, device=device)
     both = np.isfinite(gt[..., 0]) & np.isfinite(pred[..., 0])
     union = np.isfinite(gt[..., 0]) | np.isfinite(pred[..., 0])
     out = {"iou": both.sum() / max(union.sum(), 1),
@@ -180,6 +184,14 @@ def main() -> None:
     ap.add_argument("--pattern-set", default="marray")
     ap.add_argument("--frame", default="cap_pat_00.png")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--tiled", action="store_true",
+                    help="stitch full-frame inference from 256-px tiles (the training "
+                         "crop size). Auto-enabled for attn checkpoints, whose global "
+                         "attention collapses at full-frame token counts; also closes "
+                         "the conv row deficit. Force on for conv to A/B it.")
+    ap.add_argument("--tile-overlap", type=int, default=0,
+                    help="when tiling, overlap tiles + keep max-confidence per pixel "
+                         "(removes seams); default 0 = fast hard-stitch for the bench")
     ap.add_argument("--out", default=None, help="results dir (default <data>/../results_<ckpt-stem>)")
     ap.add_argument("--replot", action="store_true",
                     help="skip inference; re-draw plots from an existing per_sample.csv "
@@ -197,6 +209,9 @@ def main() -> None:
         args.device = ("mps" if torch.backends.mps.is_available()
                        else "cuda" if torch.cuda.is_available() else "cpu")
     model, proj_wh = load_checkpoint(args.ckpt, device=args.device)
+    use_tiled = args.tiled or getattr(model, "arch", "conv") == "attn"
+    print(f"inference: {'tiled-256' if use_tiled else 'full-frame'} "
+          f"(arch={getattr(model, 'arch', 'conv')})")
 
     dirs = sorted(d for d in Path(args.data).glob("sample_*") if (d / "sample.json").exists())
     if not dirs:
@@ -207,7 +222,8 @@ def main() -> None:
     rows = []
     for i, d in enumerate(dirs):
         pose = json.loads((d / "sample.json").read_text())
-        m = eval_sample(model, proj_wh, d, args.device, args.pattern_set, args.frame)
+        m = eval_sample(model, proj_wh, d, args.device, args.pattern_set, args.frame,
+                        tiled=use_tiled, overlap=args.tile_overlap)
         rows.append({**pose, **m, "name": d.name})
         if (i + 1) % 20 == 0:
             print(f"  {i + 1}/{len(dirs)} evaluated", flush=True)

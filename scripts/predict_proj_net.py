@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 
 from lux import io  # noqa: E402
-from lux.proj_net import load_checkpoint, predict_full  # noqa: E402
+from lux.proj_net import load_checkpoint, predict_full, predict_tiled  # noqa: E402
 
 
 def main() -> None:
@@ -28,6 +28,12 @@ def main() -> None:
     ap.add_argument("--pattern-set", default="marray")
     ap.add_argument("--frame", default="cap_pat_00.png")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--tiled", action="store_true",
+                    help="stitch full-frame inference from 256-px tiles (training crop "
+                         "size); auto-enabled for attn checkpoints")
+    ap.add_argument("--tile-overlap", type=int, default=128,
+                    help="when tiling, overlap tiles by this many px + keep max-confidence "
+                         "per pixel (removes seams). 0 = fast hard-stitch")
     ap.add_argument("--min-conf", type=float, default=0.0,
                     help="mask predictions whose u-bin softmax confidence is below "
                          "this (e.g. 0.9 -> ~50%% coverage at ~98%% bin accuracy); "
@@ -40,12 +46,17 @@ def main() -> None:
                        else "cuda" if torch.cuda.is_available() else "cpu")
     model, proj_wh = load_checkpoint(args.ckpt, device=args.device)
     model.to(args.device)
+    use_tiled = args.tiled or getattr(model, "arch", "conv") == "attn"
 
     for s in args.samples:
         d = Path(s)
         img = io.load_image(str(d / args.pattern_set / args.frame), gray=True)
-        pred, conf = predict_full(model, img, proj_wh, device=args.device,
-                                  return_conf=True)
+        if use_tiled:
+            pred, conf = predict_tiled(model, img, proj_wh, device=args.device,
+                                       overlap=args.tile_overlap, return_conf=True)
+        else:
+            pred, conf = predict_full(model, img, proj_wh, device=args.device,
+                                      return_conf=True)
         if args.min_conf > 0:
             pred = np.where(conf[..., None] >= args.min_conf, pred, np.nan)
         io.save_npy(str(d / "pred_proj.npy"), pred)

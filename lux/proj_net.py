@@ -197,7 +197,9 @@ def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
     ``focal_gamma`` (>0) focuses the bin CE on hard pixels (see :func:`_focal_ce`);
     ``v_weight`` scales the row (v) CE relative to the column (u) CE — v is the
     lagging axis (its deficit is concentrated in the edge / bottom-row bins).
-    Returns (total, decoded_px_l1, bce, u_bin_acc) for logging.
+    Returns (total, du_px, dv_px, bce, u_bin_acc, v_bin_acc) for logging — both axes
+    are trained (CE + offset per axis), so both are reported separately; v is the
+    lagging axis worth watching against the documented row deficit.
     """
     nu, nv = N_BINS_U, N_BINS_V
     lu, lv = pred[:, :nu], pred[:, nu:nu + nv]
@@ -216,13 +218,13 @@ def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
         + ((off[:, 1] - fv).abs() * m).sum() / nvalid
     bce = F.binary_cross_entropy_with_logits(pred[:, -1], m)
 
-    with torch.no_grad():                                # decoded px error, for logs
-        bu = lu.argmax(1)
-        du = (bu + off[:, 0].clamp(0, 1) - tu).abs() * (proj_wh[0] / nu)
-        dv = (lv.argmax(1) + off[:, 1].clamp(0, 1) - tv).abs() * (proj_wh[1] / nv)
-        l1_px = ((du + dv) / 2 * m).sum() / nvalid
-        bin_acc = ((bu == iu).float() * m).sum() / nvalid
-    return ce + offset_weight * off_l1 + bce, l1_px, bce.detach(), bin_acc
+    with torch.no_grad():                                # decoded px error, per axis, for logs
+        bu, bv = lu.argmax(1), lv.argmax(1)
+        du = ((bu + off[:, 0].clamp(0, 1) - tu).abs() * (proj_wh[0] / nu) * m).sum() / nvalid
+        dv = ((bv + off[:, 1].clamp(0, 1) - tv).abs() * (proj_wh[1] / nv) * m).sum() / nvalid
+        ubin = ((bu == iu).float() * m).sum() / nvalid
+        vbin = ((bv == iv).float() * m).sum() / nvalid
+    return ce + offset_weight * off_l1 + bce, du, dv, bce.detach(), ubin, vbin
 
 
 # --------------------------------------------------------------------------
@@ -515,6 +517,104 @@ def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
             return uv, conf_u.cpu().numpy(), conf_v.cpu().numpy()
         conf = torch.minimum(conf_u, conf_v)             # joint correspondence conf
         return uv, conf.cpu().numpy()
+    return uv
+
+
+def _tile_positions(n: int, t: int, stride: int) -> list[int]:
+    """Tile start offsets covering [0, n) with a final clamped tile to the edge."""
+    if n <= t:
+        return [0]
+    ps = list(range(0, n - t + 1, stride))
+    if ps[-1] != n - t:
+        ps.append(n - t)
+    return ps
+
+
+@torch.no_grad()
+def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
+                  device: str = "cpu", tile: int = 256, margin: int = 32,
+                  overlap: int = 0, return_conf: bool = False,
+                  conf_per_axis: bool = False):
+    """Full-frame inference by stitching ``tile``x``tile`` predictions instead of
+    running the whole frame at once.
+
+    The attention bottleneck does *global* self-attention over the 1/16-res grid, so
+    its token count scales with the input: a 256-px training crop is 16x16=256 tokens,
+    but a 1080x1920 frame is ~68x120=8160 tokens — a regime the softmax/positional
+    encoding never trained on, where accuracy collapses (verified: bin-acc 94%@256-tok
+    -> 24%@8160-tok). Tiling keeps every forward pass at the trained ``tile`` size, so
+    a resolution-sensitive model runs in-distribution. (Conv models are shift-invariant
+    and don't strictly need this — ``predict_full`` works — though tiling also closes
+    the conv row deficit, the same train-crop/eval-frame mismatch at the v extremes.)
+
+    Two stitch modes:
+
+    - ``overlap=0`` (default, cheap): **margin-crop** — each output pixel is taken from
+      the tile where it sits >= ``margin`` from the edge; border tiles fill to the frame
+      edge. A *hard* assignment, so adjacent tiles that disagree in low-context (e.g.
+      background) regions leave visible square **seams**.
+    - ``overlap>0``: **overlapping tiles + per-pixel max-confidence** — tiles run at
+      ``stride = tile - overlap`` so every pixel is covered by several offset tiles, and
+      each pixel keeps the prediction from whichever tile is most confident (and valid)
+      there. A tile's own edges have the least context -> lowest softmax confidence ->
+      they lose to a tile where the pixel is well-centred, so the seams dissolve. Larger
+      ``overlap`` = more candidates = smoother, at proportional cost (~(tile/stride)^2
+      more forward passes).
+
+    ``tile`` must be a multiple of 16. Mirrors :func:`predict_full`'s returns: ``uv``
+    (H,W,2), or with ``return_conf`` ``(uv, conf)``, or with ``conf_per_axis``
+    ``(uv, conf_u, conf_v)``.
+    """
+    H, W = img.shape
+    t = min(tile, H, W)
+
+    if overlap > 0:
+        stride = max(1, t - overlap)
+        uv = np.full((H, W, 2), np.nan, np.float32)
+        cu = np.zeros((H, W), np.float32)
+        cv = np.zeros((H, W), np.float32)
+        best = np.full((H, W), -1.0, np.float32)        # best joint conf seen per pixel
+        for y in _tile_positions(H, t, stride):
+            for x in _tile_positions(W, t, stride):
+                ruv, rcu, rcv = predict_full(model, img[y:y + t, x:x + t], proj_wh,
+                                             device=device, conf_per_axis=True)
+                # invalid (NaN uv) scores below any valid pixel, so a valid prediction
+                # from any tile always beats an abstaining one.
+                score = np.where(np.isfinite(ruv[..., 0]), np.minimum(rcu, rcv), -1.0)
+                bb = best[y:y + t, x:x + t]
+                win = score > bb
+                bb[win] = score[win]
+                uv[y:y + t, x:x + t][win] = ruv[win]
+                cu[y:y + t, x:x + t][win] = rcu[win]
+                cv[y:y + t, x:x + t][win] = rcv[win]
+        if conf_per_axis:
+            return uv, cu, cv
+        if return_conf:
+            return uv, np.minimum(cu, cv)
+        return uv
+
+    # margin-crop stitch
+    stride = max(1, t - 2 * margin)
+    uv = np.full((H, W, 2), np.nan, np.float32)
+    n_extra = 2 if conf_per_axis else (1 if return_conf else 0)
+    extra = [np.zeros((H, W), np.float32) for _ in range(n_extra)]
+    for y in _tile_positions(H, t, stride):
+        for x in _tile_positions(W, t, stride):
+            r = predict_full(model, img[y:y + t, x:x + t], proj_wh, device=device,
+                             return_conf=return_conf, conf_per_axis=conf_per_axis)
+            ruv = r[0] if n_extra else r
+            rex = r[1:] if n_extra else ()
+            top = 0 if y == 0 else margin
+            left = 0 if x == 0 else margin
+            bot = t if y + t == H else t - margin
+            right = t if x + t == W else t - margin
+            uv[y + top:y + bot, x + left:x + right] = ruv[top:bot, left:right]
+            for buf, rr in zip(extra, rex):
+                buf[y + top:y + bot, x + left:x + right] = rr[top:bot, left:right]
+    if conf_per_axis:
+        return uv, extra[0], extra[1]
+    if return_conf:
+        return uv, extra[0]
     return uv
 
 

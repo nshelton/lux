@@ -44,7 +44,7 @@ import numpy as np  # noqa: E402
 from lux import io  # noqa: E402
 from lux.methods.graycode import GrayCodeMethod  # noqa: E402
 from lux.methods.phaseshift import PhaseShiftMethod  # noqa: E402
-from lux.proj_net import load_checkpoint, predict_full, N_BINS_U, N_BINS_V  # noqa: E402
+from lux.proj_net import load_checkpoint, predict_full, predict_tiled, N_BINS_U, N_BINS_V  # noqa: E402
 
 
 def _load_stack(d: Path) -> np.ndarray:
@@ -332,6 +332,16 @@ def main() -> None:
                     help="also gate the du maps on net confidence >= this "
                          "(0 = white-valid only; ~0.5 removes the low-conf outlier tail)")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--tiled", action="store_true",
+                    help="stitch full-frame inference from 256-px tiles (training crop "
+                         "size). Auto-enabled for attn checkpoints (global attention "
+                         "collapses at full-frame token counts); also closes the conv "
+                         "row deficit.")
+    ap.add_argument("--tile-overlap", type=int, default=0,
+                    help="when tiling, overlap tiles by this many px and keep the "
+                         "max-confidence prediction per pixel — dissolves the square "
+                         "seams of the hard stitch (e.g. 128 = 50%% overlap, ~4x cost). "
+                         "0 = fast hard-stitch.")
     ap.add_argument("--out", default=None, help="results dir (default <captures>/eval_<ckpt-stem>)")
     args = ap.parse_args()
 
@@ -341,6 +351,9 @@ def main() -> None:
         args.device = ("mps" if torch.backends.mps.is_available()
                        else "cuda" if torch.cuda.is_available() else "cpu")
     model, proj_wh = load_checkpoint(args.ckpt, device=args.device)
+    use_tiled = args.tiled or getattr(model, "arch", "conv") == "attn"
+    print(f"inference: {'tiled-256' if use_tiled else 'full-frame'} "
+          f"(arch={getattr(model, 'arch', 'conv')})")
     proj_w, proj_h = proj_wh
 
     # 1. build the reference column ------------------------------------------------
@@ -378,8 +391,12 @@ def main() -> None:
     marray = io.load_image(str(cap / args.marray_set / args.marray_frame), gray=True)
     if marray.shape != ref_u.shape:
         raise SystemExit(f"marray {marray.shape} != reference {ref_u.shape}: same camera/res?")
-    pred, conf_u, conf_v = predict_full(model, marray, proj_wh, device=args.device,
-                                        conf_per_axis=True)
+    if use_tiled:
+        pred, conf_u, conf_v = predict_tiled(model, marray, proj_wh, device=args.device,
+                                             overlap=args.tile_overlap, conf_per_axis=True)
+    else:
+        pred, conf_u, conf_v = predict_full(model, marray, proj_wh, device=args.device,
+                                            conf_per_axis=True)
     # Joint correspondence confidence for the visuals/saves; the per-axis sweeps
     # below gate column on conf_u and row on conf_v (each axis on its own softmax).
     conf = np.minimum(conf_u, conf_v)

@@ -106,6 +106,16 @@ def main() -> None:
     ap.add_argument("--lr-min", type=float, default=0.0,
                     help="cosine anneal floor; >0 keeps learning alive at end of "
                          "schedule instead of decaying to zero")
+    ap.add_argument("--warmup-steps", type=int, default=0,
+                    help="linear LR warmup over the first N optimizer steps (0 -> "
+                         "--lr); de-risks a fresh transformer bottleneck at high LR. "
+                         "The per-epoch cosine recomputes from its own counter, so "
+                         "these mid-epoch-1 overrides don't perturb it. 0 disables "
+                         "(conv default).")
+    ap.add_argument("--grad-clip", type=float, default=0.0,
+                    help="clip gradient L2 norm to this value (after AMP unscale) — "
+                         "standard transformer-from-scratch hygiene against an early "
+                         "loss spike; 0 disables (conv default).")
     ap.add_argument("--offset-weight", type=float, default=2.0,
                     help="weight of the within-bin offset L1 term (raise once "
                          "bin accuracy saturates to push subpixel learning)")
@@ -216,45 +226,68 @@ def main() -> None:
     best, gstep = resume_best, 0
     off_w = args.offset_weight            # gated upward as bin accuracy is earned
     ep_bin = 0.0
+    bad_steps = 0                         # consecutive non-finite losses (NaN tripwire)
     for ep in range(1, args.epochs + 1):
         if args.gate_offset > 0:
             gate = min(max((ep_bin - 0.70) / 0.25, 0.0), 1.0)
             off_w = args.offset_weight + args.gate_offset * gate
         model.train()
-        t0, tot, l1s, bins = time.time(), 0.0, 0.0, 0.0
-        w_loss, w_l1, w_bin, tw = 0.0, 0.0, 0.0, time.time()   # window since last log line
+        t0, tot, du_s, dv_s, ub_s, vb_s = time.time(), 0.0, 0.0, 0.0, 0.0, 0.0
+        w_loss, w_du, w_dv, w_ub, w_vb, tw = 0.0, 0.0, 0.0, 0.0, 0.0, time.time()  # window since last log
         for k, (img, target, valid) in enumerate(loader, 1):
+            if args.warmup_steps and gstep < args.warmup_steps:
+                wlr = args.lr * (gstep + 1) / args.warmup_steps
+                for g in opt.param_groups:
+                    g["lr"] = wlr
             img, target, valid = (t.flatten(0, 1).to(args.device)
                                   for t in (img, target, valid))
             with torch.autocast(args.device, dtype=torch.float16, enabled=args.amp):
-                loss, l1_px, _, bin_acc = proj_loss(model(img), target, valid, ds.proj_wh,
-                                                    offset_weight=off_w,
-                                                    focal_gamma=args.focal_gamma,
-                                                    v_weight=args.v_weight)
+                loss, du_px, dv_px, _, ubacc, vbacc = proj_loss(
+                    model(img), target, valid, ds.proj_wh, offset_weight=off_w,
+                    focal_gamma=args.focal_gamma, v_weight=args.v_weight)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()
-            tot += loss.item()
-            l1s += l1_px.item()
-            bins += bin_acc.item()
-            w_loss += loss.item()
-            w_l1 += l1_px.item()
-            w_bin += bin_acc.item()
+            lval = loss.item()
+            if not np.isfinite(lval):
+                # Benign fp16 grad overflow keeps loss finite (GradScaler just skips
+                # the step); a *non-finite loss* means a NaN reached the weights and
+                # GradScaler will skip forever without repairing — abort before the
+                # epoch-end snapshot overwrites the last good checkpoints with garbage.
+                bad_steps += 1
+                if bad_steps >= 30:
+                    raise SystemExit(
+                        f"ABORT: {bad_steps} consecutive non-finite losses "
+                        f"(ep {ep} step {k}, gstep {gstep}) — net wedged on a "
+                        f"persistent NaN. Last good _ep/_last snapshots preserved.")
+                continue
+            bad_steps = 0
+            du_i, dv_i, ub_i, vb_i = du_px.item(), dv_px.item(), ubacc.item(), vbacc.item()
+            tot += lval
+            du_s += du_i; dv_s += dv_i; ub_s += ub_i; vb_s += vb_i
+            w_loss += lval
+            w_du += du_i; w_dv += dv_i; w_ub += ub_i; w_vb += vb_i
             gstep += 1
             if k % args.log_every == 0:
-                n_img = args.log_every * img.shape[0]
+                e = args.log_every
+                n_img = e * img.shape[0]
                 print(f"  ep {ep:3d} step {k:4d}/{len(loader)}  "
-                      f"loss {w_loss / args.log_every:8.4f}  "
-                      f"|du| {w_l1 / args.log_every:7.2f}px  "
-                      f"bin {w_bin / args.log_every * 100:5.1f}%  "
+                      f"loss {w_loss / e:8.4f}  "
+                      f"|du| {w_du / e:6.2f} |dv| {w_dv / e:6.2f}px  "
+                      f"bin u {w_ub / e * 100:4.1f}% v {w_vb / e * 100:4.1f}%  "
                       f"{n_img / (time.time() - tw):5.1f} img/s", flush=True)
-                log_scalar("train/loss", w_loss / args.log_every, gstep, ep)
-                log_scalar("train/du_px", w_l1 / args.log_every, gstep, ep)
-                log_scalar("train/bin_acc", w_bin / args.log_every, gstep, ep)
-                w_loss, w_l1, w_bin, tw = 0.0, 0.0, 0.0, time.time()
+                log_scalar("train/loss", w_loss / e, gstep, ep)
+                log_scalar("train/du_px", w_du / e, gstep, ep)
+                log_scalar("train/dv_px", w_dv / e, gstep, ep)
+                log_scalar("train/bin_acc", w_ub / e, gstep, ep)
+                log_scalar("train/vbin_acc", w_vb / e, gstep, ep)
+                w_loss, w_du, w_dv, w_ub, w_vb, tw = 0.0, 0.0, 0.0, 0.0, 0.0, time.time()
         sched.step()
-        ep_bin = bins / len(loader)              # feeds next epoch's offset gate
+        ep_bin = ub_s / len(loader)              # u-bin acc feeds next epoch's offset gate
         log_scalar("train/offset_weight", off_w, gstep, ep)
         med, medv, iou, vbin = evaluate(model, ds, val_idx, args.device)
         log_scalar("val/median_du_px", med, gstep, ep)
@@ -281,8 +314,9 @@ def main() -> None:
             save_checkpoint(str(stem.with_name(f"{stem.stem}_last.pt")),
                             model, ds.proj_wh, meta=meta)
             flag += " +snap"
-        print(f"epoch {ep:3d}  loss {tot / n:7.4f}  train|du| {l1s / n:7.2f}px  "
-              f"val median|du| {med:7.2f}px |dv| {medv:7.2f}px  bin {vbin * 100:.1f}%  "
+        print(f"epoch {ep:3d}  loss {tot / n:7.4f}  "
+              f"train|du| {du_s / n:5.2f} |dv| {dv_s / n:5.2f}px  "
+              f"val median|du| {med:6.2f} |dv| {medv:6.2f}px  bin {vbin * 100:.1f}%  "
               f"valid-IoU {iou:.3f}  ({time.time() - t0:.1f}s){flag}", flush=True)
 
     print(f"\nbest val median|du| {best:.2f}px -> {args.out}")
