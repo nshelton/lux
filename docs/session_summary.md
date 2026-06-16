@@ -53,6 +53,17 @@
 - **Real-world eval** — pending capture app + `eval_capture.py` (see
   `docs/plan_capture_app.md`).
 - **Self-calibration from correspondence** — designed, not built (`calibrate_from_correspondence.py`).
+- **Heteroscedastic offset uncertainty** — *code in, run deferred* for a clean conv+aug
+  A/B. `--hetero`/`--nll-weight` add a log-variance offset head (β-NLL) + a fused
+  calibrated σ map (`predict_full(return_sigma=True)`). Defaults off ⇒ existing runs
+  unaffected. Design + launch recipe in `docs/heteroscedastic_uncertainty.md`.
+- **Cliff strategy (consensus)** — `docs/cliff_plan.md`: the cliff is coarse-classification
+  under anamorphic compression, not subpixel; honest target ~70° + calibrated abstention.
+  Diagnose (overfit-oblique-batch, effective-RF-of-bottleneck, conf-vs-obliquity AURC)
+  before fixing; obliquity-weighted CE (per-axis `gt_proj` Jacobian) + from-scratch +
+  learned bin-correctness head; conv-RF-growth (dilation) over attn if RF-bound (net2
+  relabeled **untested**, not failed); pattern co-design vs the homography proxy as the
+  swing. NB: CUDA now banked (~107 img/s), so this is affordable.
 
 ## Checkpoints
 - `proj_net.pt` — best clutter model (epoch 17, 0.59 px). The baseline / warm-start source.

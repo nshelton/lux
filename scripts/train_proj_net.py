@@ -130,6 +130,18 @@ def main() -> None:
     ap.add_argument("--v-weight", type=float, default=1.0,
                     help="scale the row (v) bin CE relative to the column (u) CE; "
                          ">1 pushes the lagging row axis")
+    ap.add_argument("--hetero", action="store_true",
+                    help="heteroscedastic offset head: +2 channels predicting the "
+                         "log-variance of each offset (per-pixel subpixel uncertainty)")
+    ap.add_argument("--nll-weight", type=float, default=0.0,
+                    help="target weight of the beta-NLL offset term (warmed up from 0; "
+                         "0 disables. ~0.04 is a sane start). Implies --hetero.")
+    ap.add_argument("--nll-beta", type=float, default=0.5,
+                    help="beta-NLL exponent (Seitzer 2022): 0=plain NLL (shrugs on "
+                         "hard pixels), 1=MSE-like gradient, 0.5=keep mean-fitting")
+    ap.add_argument("--nll-warmup-epochs", type=int, default=10,
+                    help="epochs over which the NLL weight ramps 0 -> --nll-weight "
+                         "(also gated by bin accuracy, like the offset curriculum)")
     ap.add_argument("--base", type=int, default=32, help="U-Net width multiplier")
     ap.add_argument("--mid", choices=["conv", "attn"], default="conv",
                     help="bottleneck: conv block or transformer (global attention at 1/16)")
@@ -154,6 +166,7 @@ def main() -> None:
     ap.add_argument("--tb-port", type=int, default=6006,
                     help="port for the auto-launched TensorBoard server")
     args = ap.parse_args()
+    args.hetero = args.hetero or args.nll_weight > 0   # NLL needs the log-variance head
 
     # Three monitoring layers: flushed stdout (tail -f the log), TensorBoard
     # scalars (live curves), and a plain CSV (checkpoints/metrics.csv).
@@ -198,9 +211,10 @@ def main() -> None:
     print(f"train {len(train_set)} samples x {args.crops_per_sample} crops ({src}), "
           f"val {[names[i] for i in val_idx]}, device {args.device}, amp {args.amp}")
 
-    model = ProjUNet(base=args.base, mid=args.mid).to(args.device)
+    model = ProjUNet(base=args.base, mid=args.mid, heteroscedastic=args.hetero).to(args.device)
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"ProjUNet base={args.base} mid={args.mid}: {n_par / 1e6:.2f}M params")
+    print(f"ProjUNet base={args.base} mid={args.mid} hetero={args.hetero}: "
+          f"{n_par / 1e6:.2f}M params")
     resume_best = np.inf
     if args.resume:
         ck = torch.load(args.resume, map_location=args.device, weights_only=False)
@@ -228,9 +242,15 @@ def main() -> None:
     ep_bin = 0.0
     bad_steps = 0                         # consecutive non-finite losses (NaN tripwire)
     for ep in range(1, args.epochs + 1):
+        # Bin-accuracy curriculum gate in [0,1]: 0 below 70% u-bin acc, 1 at 95%.
+        # Both the offset weight and the NLL term ride it, so the subpixel mean and
+        # then its variance only earn gradient once bin classification is trustworthy.
+        gate = min(max((ep_bin - 0.70) / 0.25, 0.0), 1.0)
         if args.gate_offset > 0:
-            gate = min(max((ep_bin - 0.70) / 0.25, 0.0), 1.0)
             off_w = args.offset_weight + args.gate_offset * gate
+        # NLL weight: epoch-linear warmup 0 -> nll_weight, then gated by bin acc.
+        nll_warm = min(ep / max(1, args.nll_warmup_epochs), 1.0) if args.nll_weight > 0 else 0.0
+        nll_w = args.nll_weight * nll_warm * gate
         model.train()
         t0, tot, du_s, dv_s, ub_s, vb_s = time.time(), 0.0, 0.0, 0.0, 0.0, 0.0
         w_loss, w_du, w_dv, w_ub, w_vb, tw = 0.0, 0.0, 0.0, 0.0, 0.0, time.time()  # window since last log
@@ -244,7 +264,8 @@ def main() -> None:
             with torch.autocast(args.device, dtype=torch.float16, enabled=args.amp):
                 loss, du_px, dv_px, _, ubacc, vbacc = proj_loss(
                     model(img), target, valid, ds.proj_wh, offset_weight=off_w,
-                    focal_gamma=args.focal_gamma, v_weight=args.v_weight)
+                    focal_gamma=args.focal_gamma, v_weight=args.v_weight,
+                    nll_weight=nll_w, nll_beta=args.nll_beta)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
@@ -289,6 +310,7 @@ def main() -> None:
         sched.step()
         ep_bin = ub_s / len(loader)              # u-bin acc feeds next epoch's offset gate
         log_scalar("train/offset_weight", off_w, gstep, ep)
+        log_scalar("train/nll_weight", nll_w, gstep, ep)
         med, medv, iou, vbin = evaluate(model, ds, val_idx, args.device)
         log_scalar("val/median_du_px", med, gstep, ep)
         log_scalar("val/median_dv_px", medv, gstep, ep)

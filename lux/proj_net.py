@@ -54,7 +54,13 @@ class _Block(nn.Module):
 # which is where subpixel precision comes from). coord = (bin + frac) * bin_px.
 N_BINS_U = 60
 N_BINS_V = 36
-_HEAD_CH = N_BINS_U + N_BINS_V + 3   # + offset_u, offset_v, validity logit
+_HEAD_CH = N_BINS_U + N_BINS_V + 3   # bins + offset_u, offset_v, validity logit
+# A heteroscedastic model (ProjUNet(heteroscedastic=True)) appends two more head
+# channels: the log-variance of each offset (subpixel data-uncertainty). They are
+# inserted *before* validity, so validity stays the LAST channel either way and
+# all `pred[..., -1]` / `out[-1]` indexing is unchanged. Layout when hetero:
+#   [0:nu] u-logits | [nu:nu+nv] v-logits | nu+nv:+2 off_u,off_v |
+#   nu+nv+2:+2 logvar_u,logvar_v | -1 validity
 
 
 def _posenc_2d(h: int, w: int, d: int, device) -> torch.Tensor:
@@ -130,9 +136,10 @@ class ProjUNet(nn.Module):
     """
 
     def __init__(self, in_ch: int = 1, base: int = 32, mid: str = "conv",
-                 attn_layers: int = 4):
+                 attn_layers: int = 4, heteroscedastic: bool = False):
         super().__init__()
         self.arch = mid
+        self.hetero = heteroscedastic
         c = [base, base * 2, base * 4, base * 8]
         self.enc = nn.ModuleList()
         prev = in_ch
@@ -148,8 +155,9 @@ class ProjUNet(nn.Module):
         for ci in reversed(c):
             self.dec.append(_Block(prev + ci, ci))
             prev = ci
-        self.head = nn.Conv2d(base, _HEAD_CH, 1)
-        nn.init.zeros_(self.head.bias)
+        head_ch = _HEAD_CH + (2 if heteroscedastic else 0)   # +logvar(off_u, off_v)
+        self.head = nn.Conv2d(base, head_ch, 1)
+        nn.init.zeros_(self.head.bias)   # logvar bias 0 -> sigma^2=1 -> NLL starts MSE-like
 
     def forward(self, x):
         skips = []
@@ -187,7 +195,8 @@ def _focal_ce(logits: torch.Tensor, target_idx: torch.Tensor, m: torch.Tensor,
 
 def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
               proj_wh: tuple[int, int], offset_weight: float = 2.0,
-              focal_gamma: float = 0.0, v_weight: float = 1.0):
+              focal_gamma: float = 0.0, v_weight: float = 1.0,
+              nll_weight: float = 0.0, nll_beta: float = 0.5):
     """Classification + offset loss, masked to valid pixels.
 
     Per axis: cross-entropy over the coarse bins + L1 on the within-bin
@@ -197,6 +206,17 @@ def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
     ``focal_gamma`` (>0) focuses the bin CE on hard pixels (see :func:`_focal_ce`);
     ``v_weight`` scales the row (v) CE relative to the column (u) CE — v is the
     lagging axis (its deficit is concentrated in the edge / bottom-row bins).
+
+    ``nll_weight`` (>0) adds a **heteroscedastic beta-NLL** term on the offsets,
+    using the model's two extra log-variance channels (requires a
+    ``heteroscedastic=True`` model). It models per-pixel subpixel uncertainty
+    (sensor noise / saturation / blur) instead of assuming uniform offset noise.
+    The plain-NLL precision weighting ``exp(-s)`` lets the net cut loss by
+    inflating variance on hard pixels ("gradient shrugging"); ``nll_beta`` (Seitzer
+    et al. 2022) rescales each pixel's NLL by ``detach(sigma**(2*beta))`` to restore
+    the mean-fitting gradient there (0 = plain NLL, 1 = MSE-like, 0.5 = sweet spot).
+    The L1 offset term is **kept** as an anchor so the coordinate is always fit.
+
     Returns (total, du_px, dv_px, bce, u_bin_acc, v_bin_acc) for logging — both axes
     are trained (CE + offset per axis), so both are reported separately; v is the
     lagging axis worth watching against the documented row deficit.
@@ -218,13 +238,23 @@ def proj_loss(pred: torch.Tensor, target: torch.Tensor, valid: torch.Tensor,
         + ((off[:, 1] - fv).abs() * m).sum() / nvalid
     bce = F.binary_cross_entropy_with_logits(pred[:, -1], m)
 
+    nll = pred.new_zeros(())
+    if nll_weight > 0:                                    # heteroscedastic beta-NLL
+        s = pred[:, nu + nv + 2:nu + nv + 4].clamp(-10.0, 10.0)   # log-var, (B,2,H,W)
+        res2 = torch.stack([(off[:, 0] - fu) ** 2,
+                            (off[:, 1] - fv) ** 2], dim=1)        # (B,2,H,W)
+        nll_px = 0.5 * torch.exp(-s) * res2 + 0.5 * s            # Gaussian NLL / element
+        if nll_beta > 0:                                         # Seitzer beta-NLL reweight
+            nll_px = nll_px * torch.exp(s).pow(nll_beta).detach()
+        nll = (nll_px * m[:, None]).sum() / nvalid / 2.0        # mean over the 2 axes
+
     with torch.no_grad():                                # decoded px error, per axis, for logs
         bu, bv = lu.argmax(1), lv.argmax(1)
         du = ((bu + off[:, 0].clamp(0, 1) - tu).abs() * (proj_wh[0] / nu) * m).sum() / nvalid
         dv = ((bv + off[:, 1].clamp(0, 1) - tv).abs() * (proj_wh[1] / nv) * m).sum() / nvalid
         ubin = ((bu == iu).float() * m).sum() / nvalid
         vbin = ((bv == iv).float() * m).sum() / nvalid
-    return ce + offset_weight * off_l1 + bce, du, dv, bce.detach(), ubin, vbin
+    return ce + offset_weight * off_l1 + bce + nll_weight * nll, du, dv, bce.detach(), ubin, vbin
 
 
 # --------------------------------------------------------------------------
@@ -480,7 +510,7 @@ class ConcatLoaf(torch.utils.data.ConcatDataset):
 @torch.no_grad()
 def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
                  device: str = "cpu", return_conf: bool = False,
-                 conf_per_axis: bool = False):
+                 conf_per_axis: bool = False, return_sigma: bool = False):
     """Full-frame inference: capture (H, W) in [0,1] -> (H, W, 2) projector px,
     NaN where the validity head says the projector can't see the pixel.
 
@@ -495,6 +525,16 @@ def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
 
     ``conf_per_axis`` instead returns ``(uv, conf_u, conf_v)`` so analysis tools
     can gate each axis on its own softmax (and form the joint min themselves).
+
+    ``return_sigma`` returns ``(uv, sigma_u, sigma_v)`` — a **calibrated per-pixel
+    1-sigma uncertainty in projector pixels**, fusing the two error sources:
+    ``var = (1-p_bin)*(bin_px**2/12) + p_bin*sigma_offset**2`` per axis, where
+    ``p_bin`` is the softmax-max (prob the argmax bin is right; ``1-p_bin`` is
+    bin-flip / unwrapping-failure risk, charged a within-bin-uniform variance) and
+    ``sigma_offset`` is the heteroscedastic offset std (in px) from the log-variance
+    head. For a non-heteroscedastic model ``sigma_offset=0`` so this degrades to a
+    bin-flip-risk-only map. Use ``1/sigma**2`` to weight downstream triangulation /
+    fusion; verify calibration with a reliability diagram before trusting it.
     """
     model.eval()
     nu, nv = N_BINS_U, N_BINS_V
@@ -510,6 +550,23 @@ def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
     valid = out[-1] > 0.0                                # logit > 0 == p > 0.5
     uv = torch.where(valid[..., None], uv, torch.full_like(uv, float("nan")))
     uv = uv.float().cpu().numpy()
+    if return_sigma:
+        bu_px, bv_px = proj_wh[0] / nu, proj_wh[1] / nv
+        pu = torch.softmax(out[:nu].float(), dim=0).max(0).values       # P(bin right)
+        pv = torch.softmax(out[nu:nu + nv].float(), dim=0).max(0).values
+        if getattr(model, "hetero", False):
+            su = out[nu + nv + 2].float().clamp(-10.0, 10.0)
+            sv = out[nu + nv + 3].float().clamp(-10.0, 10.0)
+            sig_off_u = torch.exp(0.5 * su) * bu_px                     # offset std, px
+            sig_off_v = torch.exp(0.5 * sv) * bv_px
+        else:
+            sig_off_u = sig_off_v = torch.zeros_like(pu)
+        var_u = (1 - pu) * (bu_px ** 2 / 12.0) + pu * sig_off_u ** 2
+        var_v = (1 - pv) * (bv_px ** 2 / 12.0) + pv * sig_off_v ** 2
+        nan = torch.full_like(pu, float("nan"))
+        sig_u = torch.where(valid, torch.sqrt(var_u), nan).cpu().numpy()
+        sig_v = torch.where(valid, torch.sqrt(var_v), nan).cpu().numpy()
+        return uv, sig_u, sig_v
     if return_conf or conf_per_axis:
         conf_u = torch.softmax(out[:nu].float(), dim=0).max(0).values
         conf_v = torch.softmax(out[nu:nu + nv].float(), dim=0).max(0).values
@@ -622,6 +679,7 @@ def save_checkpoint(path: str, model: ProjUNet, proj_wh, meta: dict | None = Non
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save({"state": model.state_dict(), "proj_wh": proj_wh,
                 "bins": (N_BINS_U, N_BINS_V), "arch": getattr(model, "arch", "conv"),
+                "hetero": getattr(model, "hetero", False),
                 "meta": meta or {}}, path)
 
 
@@ -636,6 +694,7 @@ def load_weights_compatible(model: nn.Module, state: dict) -> int:
 
 def load_checkpoint(path: str, device: str = "cpu") -> tuple[ProjUNet, tuple[int, int]]:
     ck = torch.load(path, map_location=device, weights_only=False)
-    model = ProjUNet(mid=ck.get("arch", "conv")).to(device)
+    model = ProjUNet(mid=ck.get("arch", "conv"),
+                     heteroscedastic=ck.get("hetero", False)).to(device)
     model.load_state_dict(ck["state"])
     return model, tuple(ck["proj_wh"])

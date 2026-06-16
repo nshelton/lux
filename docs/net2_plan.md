@@ -1,5 +1,13 @@
 # net2 — Attention-Bottleneck Correspondence Net (plan + launch record)
 
+> **Status (2026-06-16, per `docs/cliff_plan.md` consensus): net2 is UNTESTED, not
+> failed.** Its val collapsed on a 256→8160 token-count train/test mismatch (the
+> resolution finding below) — a *broken eval*, not evidence about whether attention helps
+> obliquity. Do not cite net2 as "attn doesn't help." The cliff plan supersedes this:
+> if the effective-RF diagnostic says RF-bound, the fix is **conv-RF growth (dilation),
+> not a second attn run** — a conv RF has none of the crop→full-frame token-scaling
+> fragility that broke net2's eval.
+
 Started 2026-06-15. net2 is the queued transformer A/B from `session_summary.md`:
 the same proven **from-scratch** recipe that produced the best conv model
 (`proj_net_scratch.pt`, val |du| 0.28px / bin 87%), but with `--mid attn` — a 17M-param
@@ -17,7 +25,7 @@ log `checkpoints/train_attn.log`. ~60 min/epoch on MPS (attn is ~12% slower than
   --mid attn --epochs 30 --batch 64 --amp --workers 4 --val 4 \
   --lr 1e-3 --lr-min 1e-4 --offset-weight 2 --gate-offset 6 \
   --warmup-steps 400 --grad-clip 1.0 \
-  --snapshots --no-tensorboard \
+  --snapshots \
   --out checkpoints/proj_net_attn.pt --logdir runs/proj_net_attn
 ```
 
@@ -132,3 +140,8 @@ Success criterion: **attn ≥ conv on the ≥45° bins** (and the real-capture (
 3. **Oblique / full-vertical-range training distribution** — the documented *real* fix for the cliff +
    row deficit. Needs re-rendering an oblique-rich loaf and/or a full-height-strip crop change (the
    loaf/model currently use one square crop S for both axes). Multi-hour, separate job.
+4. **Heteroscedastic offset uncertainty** — *code already merged* (`--hetero`/`--nll-weight`),
+   run deferred until the conv+aug run finishes (clean A/B). Calibrated per-pixel σ via a β-NLL
+   log-variance head; orthogonal to the cliff (won't move val |du|) — it builds the
+   reliability-aware map that eventually gates oblique results. See
+   `docs/heteroscedastic_uncertainty.md`.
