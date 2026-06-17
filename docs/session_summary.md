@@ -1,5 +1,10 @@
 # Session Summary — One-Shot SL Correspondence Net
 
+> **Session 2 recap: `docs/session2_recap.md`** — tiled inference reframed the cliff/row
+> deficit as eval artifacts; the physically-ordered aug + full training gave the best
+> model yet (val 0.23px / bin 93.6%, hemisphere 45–60° 78%); the 60–75° floor is a
+> confirmed information limit. Viz: consolidated summary.png, per-pixel viewer, dashboard.
+
 ## What was built
 - **`lux/proj_net.py`** — `ProjUNet`: 4-level conv U-Net (7.85M, base 32) + a
   **classification+offset head** (60 u-bins×32px + 36 v-bins×30px + 2 offsets +
