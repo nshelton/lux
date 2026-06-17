@@ -203,7 +203,7 @@ function load(url){ read.textContent='loading '+url+'…';
 }
 const selCkpt=document.getElementById('ckpt');
 function opt(sel,val){const o=document.createElement('option');o.value=val;o.textContent=val;sel.appendChild(o);}
-function fillScenes(ck){selScene.innerHTML='';Object.keys(MANIFEST[ck]).sort().forEach(s=>opt(selScene,s));}
+function fillScenes(ck){const keep=selScene.value;selScene.innerHTML='';Object.keys(MANIFEST[ck]).sort().forEach(s=>opt(selScene,s));if([...selScene.options].some(o=>o.value===keep))selScene.value=keep;}
 function loadCur(){const ck=selCkpt.value,sc=selScene.value;if(MANIFEST[ck]&&MANIFEST[ck][sc])load(MANIFEST[ck][sc]);}
 Object.keys(MANIFEST).sort().forEach(ck=>opt(selCkpt,ck));
 selCkpt.onchange=()=>{fillScenes(selCkpt.value);loadCur();};
