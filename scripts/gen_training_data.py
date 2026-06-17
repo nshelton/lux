@@ -250,6 +250,11 @@ def add_rig_imperfections(rig: dict, rng: np.random.Generator,
         rig["noise"] = {"read": round(rng.uniform(0.0, 0.03), 4),
                         "shot": round(rng.uniform(0.0, 0.05), 4),
                         "blue": round(rng.uniform(0.0, 0.03), 4)}
+    if rng.random() < 0.5:   # glossy surface on ~half the samples: GGX specular puts the
+        rig["material"] = {  # grazing-angle Fresnel whiteout / contrast-kill physics into
+            "spec": round(rng.uniform(0.2, 1.8), 3),       # training (else absent -> the
+            "roughness": round(rng.uniform(0.08, 0.6), 3),  # likely grazing real-capture cliff)
+            "f0": round(rng.uniform(0.02, 0.10), 3)}
     return rig
 
 
@@ -262,11 +267,15 @@ def render_sample(scene_path: Path, rig_path: Path, pattern_dirs: list[str],
     rig = build_rig(rig_spec)
     optics = parse_optics(rig_spec)
     nz = rig_spec.get("noise", {})
+    mat = rig_spec.get("material", {})
     amb = json.loads(scene_path.read_text()).get("ambient", 0.05)
     cfg = RenderConfig(ambient=amb,
                        read_noise=float(nz.get("read", 0.0)),
                        shot_noise=float(nz.get("shot", 0.0)),
                        blue_noise=float(nz.get("blue", 0.0)),
+                       spec_strength=float(mat.get("spec", 0.0)),
+                       roughness=float(mat.get("roughness", 0.35)),
+                       spec_f0=float(mat.get("f0", 0.04)),
                        seed=nz.get("seed", None))
     clean = RenderConfig(ambient=amb, read_noise=0.0, shot_noise=0.0, blue_noise=0.0)
     geo = load_geometry(str(scene_path))

@@ -32,6 +32,11 @@ class RenderConfig:
     blue_noise: float = 0.0        # high-frequency (blue-spectrum) grain sigma (0 disables)
     cast_shadows: bool = True      # mask points the projector cannot see
     seed: int | None = 0           # RNG seed for noise; None = fresh entropy (random)
+    spec_strength: float = 0.0     # GGX microfacet specular weight (0 disables). Adds the
+                                   # grazing-angle Fresnel whiteout / contrast-kill physics the
+                                   # Lambertian model misses (raster_gen.render_capture).
+    roughness: float = 0.35        # GGX roughness (microfacet spread); lower = sharper highlight
+    spec_f0: float = 0.04          # Fresnel base reflectance at normal incidence (dielectric ~0.04)
 
 
 def blue_noise_field(shape, sigma: float, rng) -> np.ndarray:
