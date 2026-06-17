@@ -24,9 +24,22 @@ from-scratch `proj_net_conv_aug.pt` run finishes** (clean baseline first).
 
 The whole strategy forks on **information-limit vs support-hole**. Three tests settle it:
 
-1. **Overfit one 60–75° batch.** Decisive. Memorizes oblique correspondence ⇒ *not*
-   info/RF-limited ⇒ support hole (data/weighting/from-scratch fix it). Can't ⇒
-   physical floor ⇒ stop pushing accuracy, ship abstention.
+1. **Overfit one 60–75° batch — read it as a FRACTION, not yes/no.** "Can't overfit"
+   only means information-limit *after* ruling out capacity and optimization: **sweep LR
+   and give it enough steps** first, or a chance plateau could just be a bad LR or the
+   cls-head discretization choking. Synthetic exact-GT means no label noise to confound it
+   (the reason to run it here). Expect the informative outcome to be **partial** — it
+   overfits 60–75° to, say, 55% not 100%; that fraction *is* the achievable ceiling, not a
+   pass/fail. Confirm across **≥2 batches** before acting (the next step is expensive).
+   - Memorizes cleanly (≈100%) ⇒ *not* info/RF-limited ⇒ support hole (data/weighting/
+     from-scratch fix it). Partial/floor ⇒ ship abstention up to the ceiling, pattern beyond.
+   - **A genuine fail hands a pattern SPEC, not just "redesign."** The cliff tracks the
+     M-array window crossing the camera's resolving limit: ~20 px projector window ×
+     cos(75°)≈0.26 → ~5 px camera (borderline); at 60° ~10 px (fine). So a fail means the
+     new pattern's **coarse scale must survive cos(75°) compression above the resolving
+     limit** — the multi-scale pattern (coarse carries the bin compressed, fine carries
+     precision frontally), trading correspondence density for obliquity range. That's
+     step 7, now with a concrete target scale.
 2. **Effective RF of the bottleneck path** — measure **empirically** (gradient of one
    bottleneck-output unit w.r.t. input; spatial extent), NOT analytic. Effective RF ≈
    √(theoretical), Gaussian-tailed (Luo et al. 2016); the analytic ~150 px number would
@@ -128,3 +141,11 @@ what fans out.
    dilation (pattern first if mutable). Otherwise the support-hole fix is oblique data.
 7. Pattern co-design (hand-designed multi-scale → learned generator vs the homography proxy)
    as the swing for the ceiling and the real contribution.
+8. **Sim→real: decompose BEFORE fine-tuning** (mirror the synthetic diagnostic discipline on
+   the real side — don't jump re-baseline → fine-tune). For the failing real captures
+   (test1 grazing, test3 oblique), separate the cause: (a) sim2real appearance gap, (b)
+   obliquity past the *real* resolving limit (same cliff, not fixable by fine-tune), (c)
+   context insufficiency. Only (a) is what a fine-tune addresses. And weigh
+   **renderer-calibration first** — measure the rig's noise / PSF / sensor response and
+   inject it into the renderer; it may be cheaper-per-gain than capturing data *and* shrinks
+   the fine-tune set. "Fine-tune is the top lever" must not skip this decompose.
