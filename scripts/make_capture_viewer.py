@@ -58,33 +58,46 @@ def _lut(name: str) -> list:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ckpt", required=True,
-                    help="checkpoint stem, e.g. proj_net_conv_newaug_ep06 (matches eval_<stem> dirs)")
+    ap.add_argument("--ckpts", nargs="*", default=None,
+                    help="restrict to these checkpoint stems; default = every eval_*/ found")
     ap.add_argument("--captures-root", default="captures")
+    ap.add_argument("--force", action="store_true", help="repack even if viewer_data.bin is fresh")
     args = ap.parse_args()
     root = Path(args.captures_root)
-    stem = Path(args.ckpt).stem
-    dirs = sorted(p.parent for p in root.glob(f"*/eval_{stem}/pred.npy"))
-    if not dirs:
-        raise SystemExit(f"no captures/*/eval_{stem}/pred.npy under {root}")
-    manifest = []
-    for d in dirs:
-        H, W, pw, ph = _pack(d)
+    want = {Path(c).stem for c in args.ckpts} if args.ckpts else None
+    # discover every captures/<scene>/eval_<ckpt>/ that has the required arrays
+    manifest: dict[str, dict[str, str]] = {}
+    for f in sorted(root.glob("*/eval_*/pred.npy")):
+        d = f.parent
+        if not ((d / "ref_col.npy").exists() and (d / "conf.npy").exists()):
+            continue
+        ckpt = d.name[len("eval_"):]
         scene = d.parent.name
-        manifest.append({"name": scene, "url": f"{scene}/{d.name}/viewer_data.bin"})
-        print(f"  packed {scene}  ({W}x{H})")
+        if want and ckpt not in want:
+            continue
+        bin_ = d / "viewer_data.bin"
+        if args.force or not bin_.exists() or bin_.stat().st_mtime < f.stat().st_mtime:
+            try:
+                _pack(d)
+                print(f"  packed {ckpt} / {scene}")
+            except Exception as e:  # noqa: BLE001 - skip incompatible old dirs
+                print(f"  skip   {ckpt} / {scene}  ({e})")
+                continue
+        manifest.setdefault(ckpt, {})[scene] = f"{scene}/{d.name}/viewer_data.bin"
+    if not manifest:
+        raise SystemExit(f"no usable eval_*/ dirs under {root}")
     html = (_HTML
             .replace("__MANIFEST__", json.dumps(manifest))
             .replace("__TURBO__", json.dumps(_lut("turbo")))
-            .replace("__DIVERGE__", json.dumps(_lut("coolwarm")))
-            .replace("__CKPT__", stem))
-    out = root / f"view_{stem}.html"
+            .replace("__DIVERGE__", json.dumps(_lut("coolwarm"))))
+    out = root / "view.html"
     out.write_text(html)
-    print(f"\nviewer -> {out}   ({len(manifest)} scenes)")
-    print(f"open:    ~/.venvs/lux/bin/python -m http.server --directory {root}  ->  :8000/{out.name}")
+    nck, nsc = len(manifest), len({s for v in manifest.values() for s in v})
+    print(f"\nviewer -> {out}   ({nck} checkpoints x up to {nsc} scenes)")
+    print(f"open:    ~/.venvs/lux/bin/python -m http.server --directory {root}  ->  :8000/view.html")
 
 
-_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>capture viewer — __CKPT__</title>
+_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>capture viewer</title>
 <style>
  body{margin:0;background:#111;color:#ddd;font:13px system-ui,sans-serif}
  #ctl{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:8px 10px;background:#181818}
@@ -98,7 +111,7 @@ _HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>capture view
  #read{font-family:ui-monospace,monospace;background:#181818;padding:5px 9px;border-radius:4px}
 </style></head><body>
 <div id="ctl">
- <b>__CKPT__</b>
+ <label>ckpt <select id="ckpt"></select></label>
  <label>scene <select id="scene"></select></label>
  <label>layer <select id="layer">
    <option value="du">du error ±2px</option>
@@ -188,9 +201,15 @@ function load(url){ read.textContent='loading '+url+'…';
    last=null; renderBase(); read.textContent=`${W}x${H}, proj ${D.PW}x${D.PH} — hover the image`;
  }).catch(e=>read.textContent='load failed: '+e+' (serve via http.server from captures/)');
 }
-MANIFEST.forEach((m,i)=>{const o=document.createElement('option');o.value=m.url;o.textContent=m.name;selScene.appendChild(o);});
-selScene.onchange=()=>load(selScene.value);
-if(MANIFEST.length) load(MANIFEST[0].url); else read.textContent='no scenes in manifest';
+const selCkpt=document.getElementById('ckpt');
+function opt(sel,val){const o=document.createElement('option');o.value=val;o.textContent=val;sel.appendChild(o);}
+function fillScenes(ck){selScene.innerHTML='';Object.keys(MANIFEST[ck]).sort().forEach(s=>opt(selScene,s));}
+function loadCur(){const ck=selCkpt.value,sc=selScene.value;if(MANIFEST[ck]&&MANIFEST[ck][sc])load(MANIFEST[ck][sc]);}
+Object.keys(MANIFEST).sort().forEach(ck=>opt(selCkpt,ck));
+selCkpt.onchange=()=>{fillScenes(selCkpt.value);loadCur();};
+selScene.onchange=loadCur;
+const cks=Object.keys(MANIFEST).sort(), def=cks.find(c=>c.includes('newaug'))||cks[0];
+if(def){selCkpt.value=def;fillScenes(def);loadCur();}else read.textContent='no checkpoints in manifest';
 </script></body></html>"""
 
 
