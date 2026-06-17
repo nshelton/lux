@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 
 from lux.proj_net import (  # noqa: E402
     ProjUNet, ProjSamples, LoafSamples, ConcatLoaf, proj_loss, predict_full,
-    save_checkpoint, load_weights_compatible,
+    predict_tiled, save_checkpoint, load_weights_compatible,
 )
 
 
@@ -38,13 +38,16 @@ def auto_device() -> str:
 
 
 @torch.no_grad()
-def evaluate(model, ds, val_idx, device) -> tuple[float, float, float, float]:
-    """Median |du|, |dv| (px), validity IoU and u-bin accuracy, full-frame."""
+def evaluate(model, ds, val_idx, device, tiled=False) -> tuple[float, float, float, float]:
+    """Median |du|, |dv| (px), validity IoU and u-bin accuracy. Full-frame, or
+    tiled-256 at the training crop scale when ``tiled`` — required for the attn
+    bottleneck (full-frame collapses to chance) and honest for conv (full-frame
+    understates the row axis). Margin-crop (deterministic), not max-conf."""
     from lux.proj_net import N_BINS_U
     du, dv, ious, bacc = [], [], [], []
     for i in val_idx:
         img, gt = ds.full(i)
-        pred = predict_full(model, img, ds.proj_wh, device=device)
+        pred = (predict_tiled if tiled else predict_full)(model, img, ds.proj_wh, device=device)
         both = np.isfinite(gt[..., 0]) & np.isfinite(pred[..., 0])
         if both.any():
             du.append(np.abs((pred[..., 0] - gt[..., 0])[both]))
@@ -134,6 +137,11 @@ def main() -> None:
     ap.add_argument("--mid", choices=["conv", "attn"], default="conv",
                     help="bottleneck: conv block or transformer (global attention at 1/16)")
     ap.add_argument("--val", type=int, default=1, help="samples held out for eval")
+    ap.add_argument("--tiled-eval", action="store_true",
+                    help="run the in-loop val with tiled-256 inference instead of "
+                         "full-frame (auto-on for --mid attn, whose full-frame eval "
+                         "collapses to chance); makes val curves honest. conv default "
+                         "off -> full-frame, bit-identical to before.")
     ap.add_argument("--workers", type=int, default=2, help="DataLoader workers")
     ap.add_argument("--limit", type=int, default=None,
                     help="cap the number of training samples (quick runs)")
@@ -201,6 +209,8 @@ def main() -> None:
     model = ProjUNet(base=args.base, mid=args.mid).to(args.device)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"ProjUNet base={args.base} mid={args.mid}: {n_par / 1e6:.2f}M params")
+    use_tiled_eval = args.tiled_eval or args.mid == "attn"
+    print(f"in-loop val: {'tiled-256' if use_tiled_eval else 'full-frame'}")
     resume_best = np.inf
     if args.resume:
         ck = torch.load(args.resume, map_location=args.device, weights_only=False)
@@ -289,7 +299,7 @@ def main() -> None:
         sched.step()
         ep_bin = ub_s / len(loader)              # u-bin acc feeds next epoch's offset gate
         log_scalar("train/offset_weight", off_w, gstep, ep)
-        med, medv, iou, vbin = evaluate(model, ds, val_idx, args.device)
+        med, medv, iou, vbin = evaluate(model, ds, val_idx, args.device, tiled=use_tiled_eval)
         log_scalar("val/median_du_px", med, gstep, ep)
         log_scalar("val/median_dv_px", medv, gstep, ep)
         log_scalar("val/valid_iou", iou, gstep, ep)

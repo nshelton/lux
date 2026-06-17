@@ -533,7 +533,7 @@ def _tile_positions(n: int, t: int, stride: int) -> list[int]:
 @torch.no_grad()
 def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
                   device: str = "cpu", tile: int = 256, margin: int = 32,
-                  overlap: int = 0, return_conf: bool = False,
+                  overlap: int = 0, reflect: bool = False, return_conf: bool = False,
                   conf_per_axis: bool = False):
     """Full-frame inference by stitching ``tile``x``tile`` predictions instead of
     running the whole frame at once.
@@ -593,24 +593,33 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
             return uv, np.minimum(cu, cv)
         return uv
 
-    # margin-crop stitch
+    # margin-crop stitch (deterministic — use this for the canonical metric; max-conf
+    # above is for output). reflect=True pads the frame by `margin` first, so the TRUE
+    # outer ring is decoded centrally too — otherwise the outermost margin-px come from a
+    # tile where they sit at the real frame edge, with no neighbour to centre them.
+    pad = margin if reflect else 0
+    src = np.pad(img, pad, mode="reflect") if pad else img
+    Hs, Ws = src.shape
     stride = max(1, t - 2 * margin)
-    uv = np.full((H, W, 2), np.nan, np.float32)
+    uv = np.full((Hs, Ws, 2), np.nan, np.float32)
     n_extra = 2 if conf_per_axis else (1 if return_conf else 0)
-    extra = [np.zeros((H, W), np.float32) for _ in range(n_extra)]
-    for y in _tile_positions(H, t, stride):
-        for x in _tile_positions(W, t, stride):
-            r = predict_full(model, img[y:y + t, x:x + t], proj_wh, device=device,
+    extra = [np.zeros((Hs, Ws), np.float32) for _ in range(n_extra)]
+    for y in _tile_positions(Hs, t, stride):
+        for x in _tile_positions(Ws, t, stride):
+            r = predict_full(model, src[y:y + t, x:x + t], proj_wh, device=device,
                              return_conf=return_conf, conf_per_axis=conf_per_axis)
             ruv = r[0] if n_extra else r
             rex = r[1:] if n_extra else ()
             top = 0 if y == 0 else margin
             left = 0 if x == 0 else margin
-            bot = t if y + t == H else t - margin
-            right = t if x + t == W else t - margin
+            bot = t if y + t == Hs else t - margin
+            right = t if x + t == Ws else t - margin
             uv[y + top:y + bot, x + left:x + right] = ruv[top:bot, left:right]
             for buf, rr in zip(extra, rex):
                 buf[y + top:y + bot, x + left:x + right] = rr[top:bot, left:right]
+    if pad:
+        uv = uv[pad:pad + H, pad:pad + W]
+        extra = [e[pad:pad + H, pad:pad + W] for e in extra]
     if conf_per_axis:
         return uv, extra[0], extra[1]
     if return_conf:
