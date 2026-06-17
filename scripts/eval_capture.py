@@ -262,6 +262,38 @@ def save_summary(ref_u, ref_v, pred, conf, both, coverage, out: Path, ref_label:
     print(f"summary -> {out}/summary.png")
 
 
+def save_error_map(ref_u, ref_v, pred, both, out: Path, clamp: float = 2.0) -> None:
+    """Signed du/dv error maps on a diverging colormap, **clamped to ±clamp px** — a
+    1px error then saturates, so small-error *structure* (oblique bands, occlusion
+    edges) is visible, which the full-range coordinate maps wash out. Invalid dark."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("(matplotlib not installed - skipped error map)")
+        return
+    cmap = plt.cm.RdBu.copy(); cmap.set_bad("0.12")
+    has_v = ref_v is not None
+    fig, ax = plt.subplots(1, 2 if has_v else 1, figsize=(11 * (2 if has_v else 1), 6), squeeze=False)
+    du = np.where(both, pred[..., 0] - ref_u, np.nan)
+    im = ax[0, 0].imshow(du, cmap=cmap, vmin=-clamp, vmax=clamp)
+    ax[0, 0].set_title(f"du = pred - ref col  (clamp ±{clamp:g}px)")
+    ax[0, 0].set_xticks([]); ax[0, 0].set_yticks([])
+    fig.colorbar(im, ax=ax[0, 0], fraction=0.046, pad=0.02, label="du (px)")
+    if has_v:
+        validv = both & np.isfinite(ref_v)
+        dv = np.where(validv, pred[..., 1] - ref_v, np.nan)
+        im = ax[0, 1].imshow(dv, cmap=cmap, vmin=-clamp, vmax=clamp)
+        ax[0, 1].set_title(f"dv = pred - ref row  (clamp ±{clamp:g}px)")
+        ax[0, 1].set_xticks([]); ax[0, 1].set_yticks([])
+        fig.colorbar(im, ax=ax[0, 1], fraction=0.046, pad=0.02, label="dv (px)")
+    fig.suptitle(f"{out.parent.name}: signed error, clamped (small errors visible)")
+    fig.savefig(out / "error_clamped.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"error map -> {out}/error_clamped.png")
+
+
 def save_uv_grid(col_gc, pred, conf, white_valid, min_conf, proj_w, proj_h,
                  out: Path, row_ref=None) -> None:
     """2x3 grid: rows = x (column) / y (row); columns = graycode | neural | diff.
@@ -565,6 +597,7 @@ def main() -> None:
     diff_valid = white_valid & (conf >= args.min_conf)
     # detailed spatial maps (where the errors are) — opt-in to keep the folder clean
     if args.maps:
+        save_error_map(ref_u, ref_v, pred, both, out)   # clamped signed du/dv (small errors visible)
         io.save_image(str(out / "pred_uv_conf.png"),
                       io.uv_conf_to_rgb(pred, conf, proj_wh[0], proj_wh[1]))
         save_conf_map(conf, white_valid, out)   # readable turbo confidence map
