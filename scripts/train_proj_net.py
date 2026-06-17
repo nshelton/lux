@@ -38,7 +38,7 @@ def auto_device() -> str:
 
 
 @torch.no_grad()
-def evaluate(model, ds, val_idx, device, tiled=True) -> tuple[float, float, float, float]:
+def evaluate(model, ds, val_idx, device, tiled=True, overlap=64) -> tuple[float, float, float, float]:
     """Median |du|, |dv| (px), validity IoU and u-bin accuracy.
 
     ``tiled`` (default True) stitches each frame from training-size tiles
@@ -54,7 +54,8 @@ def evaluate(model, ds, val_idx, device, tiled=True) -> tuple[float, float, floa
     du, dv, ious, bacc = [], [], [], []
     for i in val_idx:
         img, gt = ds.full(i)
-        pred = (predict_tiled(model, img, ds.proj_wh, device=device, overlap=0)
+        pred = (predict_tiled(model, img, ds.proj_wh, device=device,
+                              overlap=overlap, select="center")
                 if tiled else
                 predict_full(model, img, ds.proj_wh, device=device))
         both = np.isfinite(gt[..., 0]) & np.isfinite(pred[..., 0])
@@ -162,6 +163,10 @@ def main() -> None:
                     help="evaluate val via predict_tiled (in-distribution, honest "
                          "curves) vs full-frame predict_full (OOD, lies on attn / conv "
                          "row deficit). On by default; --no-eval-tiled for the old behavior.")
+    ap.add_argument("--eval-overlap", type=int, default=64,
+                    help="tile overlap for tiled eval (center-crop stitch: each pixel "
+                         "from the tile it's most central in, margin m=overlap/2, frame "
+                         "reflect-padded by m). 64 -> stride 192, ~1.4x passes, seamless.")
     ap.add_argument("--workers", type=int, default=2, help="DataLoader workers")
     ap.add_argument("--limit", type=int, default=None,
                     help="cap the number of training samples (quick runs)")
@@ -327,7 +332,8 @@ def main() -> None:
         ep_bin = ub_s / len(loader)              # u-bin acc feeds next epoch's offset gate
         log_scalar("train/offset_weight", off_w, gstep, ep)
         log_scalar("train/nll_weight", nll_w, gstep, ep)
-        med, medv, iou, vbin = evaluate(model, ds, val_idx, args.device, tiled=args.eval_tiled)
+        med, medv, iou, vbin = evaluate(model, ds, val_idx, args.device,
+                                        tiled=args.eval_tiled, overlap=args.eval_overlap)
         log_scalar("val/median_du_px", med, gstep, ep)
         log_scalar("val/median_dv_px", medv, gstep, ep)
         log_scalar("val/valid_iou", iou, gstep, ep)

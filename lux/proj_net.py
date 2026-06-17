@@ -609,7 +609,8 @@ def _tile_positions(n: int, t: int, stride: int) -> list[int]:
 def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
                   device: str = "cpu", tile: int = 256, margin: int = 32,
                   overlap: int = 0, return_conf: bool = False,
-                  conf_per_axis: bool = False, conf_fn=None):
+                  conf_per_axis: bool = False, conf_fn=None,
+                  select: str = "confidence"):
     """Full-frame inference by stitching ``tile``x``tile`` predictions instead of
     running the whole frame at once.
 
@@ -628,14 +629,20 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
       the tile where it sits >= ``margin`` from the edge; border tiles fill to the frame
       edge. A *hard* assignment, so adjacent tiles that disagree in low-context (e.g.
       background) regions leave visible square **seams**.
-    - ``overlap>0``: **overlapping tiles + per-pixel max-confidence** — tiles run at
-      ``stride = tile - overlap`` so every pixel is covered by several offset tiles, and
-      each pixel keeps the prediction from whichever tile is most confident (and valid)
-      there. A tile's own edges have the least context -> lowest confidence (``conf_fn``,
-      softmax-max by default; see :func:`_softmax_conf`) -> they lose to a tile where the
-      pixel is well-centred, so the seams dissolve. Larger
-      ``overlap`` = more candidates = smoother, at proportional cost (~(tile/stride)^2
-      more forward passes).
+    - ``overlap>0``: **overlapping tiles**, tiles run at ``stride = tile - overlap`` so
+      every pixel is covered by several offset tiles and the seams dissolve. ``select``
+      chooses the per-pixel winner among the (valid) candidates:
+        - ``"center"`` (recommended for eval): keep the pixel from whichever tile it is
+          most **central** in (max distance to that tile's edge). Pure geometry — no
+          dependence on the softmax, which is miscalibrated in the oblique band — so this
+          is "take the centre of each tile" done deterministically. The winning tile
+          changes gradually across the frame, so transitions are between two
+          well-centred (hence agreeing) predictions: no seams.
+        - ``"confidence"`` (default; deployment): keep the most confident (``conf_fn``,
+          softmax-max by default; see :func:`_softmax_conf`). Resolves genuine
+          disagreement by certainty, but inherits the softmax's oblique over-confidence.
+      Larger ``overlap`` = more candidates = smoother, at proportional cost
+      (~(tile/stride)^2 more forward passes).
 
     ``tile`` must be a multiple of 16. Mirrors :func:`predict_full`'s returns: ``uv``
     (H,W,2), or with ``return_conf`` ``(uv, conf)``, or with ``conf_per_axis``
@@ -646,24 +653,39 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
 
     if overlap > 0:
         stride = max(1, t - overlap)
-        uv = np.full((H, W, 2), np.nan, np.float32)
-        cu = np.zeros((H, W), np.float32)
-        cv = np.zeros((H, W), np.float32)
-        best = np.full((H, W), -1.0, np.float32)        # best joint conf seen per pixel
-        for y in _tile_positions(H, t, stride):
-            for x in _tile_positions(W, t, stride):
-                ruv, rcu, rcv = predict_full(model, img[y:y + t, x:x + t], proj_wh,
+        # `center` mode reflect-pads the frame by m = overlap//2 so the frame's OWN
+        # edge pixels become eligible to sit central in some tile (without it the
+        # outer m-ring is stuck at a tile edge — the documented top/bottom row
+        # deficit). The model only ever sees the reflect-pad it trained on. Crop
+        # back at the end. (confidence mode keeps the original frame, m=0.)
+        m = (overlap // 2) if select == "center" else 0
+        src = np.pad(img, m, mode="reflect") if m else img
+        Hs, Ws = src.shape
+        uv = np.full((Hs, Ws, 2), np.nan, np.float32)
+        cu = np.zeros((Hs, Ws), np.float32)
+        cv = np.zeros((Hs, Ws), np.float32)
+        best = np.full((Hs, Ws), -1.0, np.float32)      # best selection score per pixel
+        # centrality window: distance to the nearest tile edge, peaks at the centre.
+        ci = np.minimum(np.arange(t), t - 1 - np.arange(t)).astype(np.float32)
+        cent = np.minimum.outer(ci, ci)                 # (t, t)
+        for y in _tile_positions(Hs, t, stride):
+            for x in _tile_positions(Ws, t, stride):
+                ruv, rcu, rcv = predict_full(model, src[y:y + t, x:x + t], proj_wh,
                                              device=device, conf_per_axis=True,
                                              conf_fn=conf_fn)
-                # invalid (NaN uv) scores below any valid pixel, so a valid prediction
-                # from any tile always beats an abstaining one.
-                score = np.where(np.isfinite(ruv[..., 0]), np.minimum(rcu, rcv), -1.0)
+                # invalid (NaN uv) scores below any valid pixel (-1), so a valid
+                # prediction from any tile always beats an abstaining one.
+                valid = np.isfinite(ruv[..., 0])
+                pick = cent if select == "center" else np.minimum(rcu, rcv)
+                score = np.where(valid, pick, -1.0)
                 bb = best[y:y + t, x:x + t]
                 win = score > bb
                 bb[win] = score[win]
                 uv[y:y + t, x:x + t][win] = ruv[win]
                 cu[y:y + t, x:x + t][win] = rcu[win]
                 cv[y:y + t, x:x + t][win] = rcv[win]
+        if m:                                           # crop the reflect-pad back off
+            uv, cu, cv = uv[m:m + H, m:m + W], cu[m:m + H, m:m + W], cv[m:m + H, m:m + W]
         if conf_per_axis:
             return uv, cu, cv
         if return_conf:
