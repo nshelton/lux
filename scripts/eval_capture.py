@@ -204,6 +204,64 @@ def save_histograms(ref_u, pred, conf, both, out: Path, ref_label: str,
     print(f"histograms -> {out}/histograms.png")
 
 
+def save_summary(ref_u, ref_v, pred, conf, both, coverage, out: Path, ref_label: str) -> None:
+    """One consolidated figure — the only one you normally need:
+      [0,0] du / dv error histogram, linear y   [0,1] same, log y (off-bin shoulders / tail)
+      [1,0] confidence distribution             [1,1] valid px retained vs confidence threshold
+    du and dv overlaid with transparency; dotted markers at ±1,2 bin (32 / 30 px)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("(matplotlib not installed - skipped summary)")
+        return
+    du = (pred[..., 0] - ref_u)[both]                     # signed column error, valid px
+    cf = conf[both]
+    dv = None
+    if ref_v is not None:
+        sel_v = both & np.isfinite(ref_v)
+        dv = (pred[..., 1] - ref_v)[sel_v]
+    clip = 96
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+
+    def err_panel(a, logy):
+        a.hist(np.clip(du, -clip, clip), bins=193, range=(-clip, clip),
+               color="C0", alpha=0.55, label=f"du  (med|du| {np.median(np.abs(du)):.2f})")
+        if dv is not None and dv.size:
+            a.hist(np.clip(dv, -clip, clip), bins=193, range=(-clip, clip),
+                   color="C1", alpha=0.55, label=f"dv  (med|dv| {np.median(np.abs(dv)):.2f})")
+        a.axvline(0, color="k", lw=0.6)
+        for k in (-64, -32, 32, 64):
+            a.axvline(k, color="0.7", lw=0.5, ls=":")
+        if logy:
+            a.set_yscale("log")
+        a.set_title(f"du / dv error ({'log' if logy else 'linear'} y)")
+        a.set_xlabel("error (px, clip ±96)   dotted = ±1,2 bin")
+        a.set_ylabel("pixels"); a.legend(fontsize=8)
+
+    err_panel(ax[0, 0], logy=False)
+    err_panel(ax[0, 1], logy=True)
+
+    a = ax[1, 0]
+    a.hist(cf, bins=50, range=(0, 1), color="C2", alpha=0.85)
+    a.set_title(f"confidence  (median {np.median(cf):.2f})")
+    a.set_xlabel("confidence"); a.set_ylabel("valid pixels")
+
+    a = ax[1, 1]
+    ts = np.linspace(0, 1, 101)
+    retained = cf.size - np.searchsorted(np.sort(cf), ts)   # # pixels with conf >= t
+    a.plot(ts, retained, color="C3"); a.fill_between(ts, retained, color="C3", alpha=0.15)
+    a.set_title(f"valid px retained vs conf  (total {cf.size:,}, cov {coverage:.2f})")
+    a.set_xlabel("confidence threshold"); a.set_ylabel("number of valid pixels"); a.set_ylim(bottom=0)
+
+    fig.suptitle(f"{out.parent.name}  vs {ref_label}   coverage {coverage:.2f}", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out / "summary.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"summary -> {out}/summary.png")
+
+
 def save_uv_grid(col_gc, pred, conf, white_valid, min_conf, proj_w, proj_h,
                  out: Path, row_ref=None) -> None:
     """2x3 grid: rows = x (column) / y (row); columns = graycode | neural | diff.
@@ -343,6 +401,10 @@ def main() -> None:
                          "most central in (geometry, not softmax — honest for the metric), "
                          "frame reflect-padded. 64 -> stride 192, ~1.4x passes, seamless; "
                          "0 = hard margin-crop.")
+    ap.add_argument("--maps", action="store_true",
+                    help="also write the detailed spatial maps (uv grid, confidence/du "
+                         "turbo maps, overview, white) — off by default; the consolidated "
+                         "summary.png is the everyday output.")
     ap.add_argument("--out", default=None, help="results dir (default <captures>/eval_<ckpt-stem>)")
     args = ap.parse_args()
 
@@ -498,17 +560,22 @@ def main() -> None:
     np.save(out / "conf.npy", conf)
     if ref_v is not None:
         np.save(out / "ref_row.npy", ref_v)
-    # net prediction quick-look: R=col(x), G=row(y), B=confidence (invalid->black)
-    io.save_image(str(out / "pred_uv_conf.png"),
-                  io.uv_conf_to_rgb(pred, conf, proj_wh[0], proj_wh[1]))
-    save_conf_map(conf, white_valid, out)   # readable turbo confidence map
-    save_uv_grid(col_gc, pred, conf, white_valid, args.min_conf, proj_wh[0], proj_wh[1], out,
-                 row_ref=ref_v)
-    save_histograms(ref_u, pred, conf, both, out, args.reference, dv_ref=ref_v)
-    io.save_image(str(out / "white.png"), white)
-    io.save_image(str(out / "valid_white.png"), white_valid.astype(np.float64))
+    # the consolidated figure you actually read (du/dv hists + confidence + coverage)
+    save_summary(ref_u, ref_v, pred, conf, both, coverage, out, args.reference)
     diff_valid = white_valid & (conf >= args.min_conf)
-    diff_mask = save_du_maps(ref_u, pred_u, diff_valid, proj_w, out, args.reference, col_gc=col_gc)
+    # detailed spatial maps (where the errors are) — opt-in to keep the folder clean
+    if args.maps:
+        io.save_image(str(out / "pred_uv_conf.png"),
+                      io.uv_conf_to_rgb(pred, conf, proj_wh[0], proj_wh[1]))
+        save_conf_map(conf, white_valid, out)   # readable turbo confidence map
+        save_uv_grid(col_gc, pred, conf, white_valid, args.min_conf, proj_wh[0], proj_wh[1], out,
+                     row_ref=ref_v)
+        save_histograms(ref_u, pred, conf, both, out, args.reference, dv_ref=ref_v)
+        io.save_image(str(out / "white.png"), white)
+        io.save_image(str(out / "valid_white.png"), white_valid.astype(np.float64))
+        diff_mask = save_du_maps(ref_u, pred_u, diff_valid, proj_w, out, args.reference, col_gc=col_gc)
+    else:
+        diff_mask = diff_valid
     summary = {"ckpt": args.ckpt, "captures": str(cap), "reference": args.reference,
                "proj_wh": list(proj_wh), "ref_valid_px": int(ref_valid.sum()),
                "pred_valid_px": int(pred_valid.sum()),
@@ -525,8 +592,9 @@ def main() -> None:
                           "uv_bin_acc": uv_acc,
                           "row_sweep": row_sweep, "uv_sweep": uv_sweep}
     (out / "metrics.json").write_text(json.dumps(summary, indent=2))
-    plot_overview(ref_u, pred_u, both, proj_w, out / "overview.png",
-                  f"{Path(args.ckpt).name}  vs {args.reference}  —  {cap.name}", args.reference)
+    if args.maps:
+        plot_overview(ref_u, pred_u, both, proj_w, out / "overview.png",
+                      f"{Path(args.ckpt).name}  vs {args.reference}  —  {cap.name}", args.reference)
     print(f"\nmetrics -> {out}/metrics.json")
 
 
