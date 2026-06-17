@@ -31,7 +31,8 @@ def eval_sample(model, proj_wh, d: Path, device: str, pattern_set: str, frame: s
     img = io.load_image(str(d / pattern_set / frame), gray=True)
     gt = np.load(d / "gt_proj.npy")
     if tiled:
-        pred = predict_tiled(model, img, proj_wh, device=device, overlap=overlap)
+        pred = predict_tiled(model, img, proj_wh, device=device, overlap=overlap,
+                             select="center")
     else:
         pred = predict_full(model, img, proj_wh, device=device)
     both = np.isfinite(gt[..., 0]) & np.isfinite(pred[..., 0])
@@ -189,9 +190,10 @@ def main() -> None:
                          "crop size). Auto-enabled for attn checkpoints, whose global "
                          "attention collapses at full-frame token counts; also closes "
                          "the conv row deficit. Force on for conv to A/B it.")
-    ap.add_argument("--tile-overlap", type=int, default=0,
-                    help="when tiling, overlap tiles + keep max-confidence per pixel "
-                         "(removes seams); default 0 = fast hard-stitch for the bench")
+    ap.add_argument("--tile-overlap", type=int, default=64,
+                    help="overlapping center-crop stitch: each pixel from the tile it's "
+                         "most central in (geometry, not softmax), frame reflect-padded. "
+                         "64 -> stride 192, ~1.4x passes, seamless; 0 = hard margin-crop.")
     ap.add_argument("--out", default=None, help="results dir (default <data>/../results_<ckpt-stem>)")
     ap.add_argument("--replot", action="store_true",
                     help="skip inference; re-draw plots from an existing per_sample.csv "

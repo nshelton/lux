@@ -49,7 +49,8 @@ from lux.proj_net import load_checkpoint, predict_full, predict_tiled, N_BINS_U,
 
 def _load_stack(d: Path) -> np.ndarray:
     """Load a capture set's frames (cap_*.png) as a grayscale (N, H, W) stack."""
-    files = sorted(p for ext in ("*.png", "*.jpg", "*.jpeg") for p in d.glob(ext))
+    files = sorted(p for ext in ("*.png", "*.jpg", "*.jpeg") for p in d.glob(ext)
+                   if not p.name.startswith("."))   # skip macOS ._* AppleDouble sidecars (exFAT)
     if not files:
         raise SystemExit(f"no capture frames in {d}")
     return np.stack([io.load_image(str(f), gray=True) for f in files], axis=0)
@@ -337,11 +338,11 @@ def main() -> None:
                          "size). Auto-enabled for attn checkpoints (global attention "
                          "collapses at full-frame token counts); also closes the conv "
                          "row deficit.")
-    ap.add_argument("--tile-overlap", type=int, default=0,
-                    help="when tiling, overlap tiles by this many px and keep the "
-                         "max-confidence prediction per pixel — dissolves the square "
-                         "seams of the hard stitch (e.g. 128 = 50%% overlap, ~4x cost). "
-                         "0 = fast hard-stitch.")
+    ap.add_argument("--tile-overlap", type=int, default=64,
+                    help="overlapping center-crop stitch: each pixel from the tile it's "
+                         "most central in (geometry, not softmax — honest for the metric), "
+                         "frame reflect-padded. 64 -> stride 192, ~1.4x passes, seamless; "
+                         "0 = hard margin-crop.")
     ap.add_argument("--out", default=None, help="results dir (default <captures>/eval_<ckpt-stem>)")
     args = ap.parse_args()
 
@@ -393,7 +394,8 @@ def main() -> None:
         raise SystemExit(f"marray {marray.shape} != reference {ref_u.shape}: same camera/res?")
     if use_tiled:
         pred, conf_u, conf_v = predict_tiled(model, marray, proj_wh, device=args.device,
-                                             overlap=args.tile_overlap, conf_per_axis=True)
+                                             overlap=args.tile_overlap, conf_per_axis=True,
+                                             select="center")
     else:
         pred, conf_u, conf_v = predict_full(model, marray, proj_wh, device=args.device,
                                             conf_per_axis=True)
