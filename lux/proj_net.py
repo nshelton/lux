@@ -507,10 +507,24 @@ class ConcatLoaf(torch.utils.data.ConcatDataset):
 # --------------------------------------------------------------------------
 # Inference
 # --------------------------------------------------------------------------
+def _softmax_conf(out: torch.Tensor, nu: int, nv: int):
+    """Default per-axis correspondence confidence: the bin-softmax maxima
+    ``(conf_u, conf_v)``. This is the ONE confidence source shared by the
+    seam-stitcher (:func:`predict_tiled` max-confidence tile selection) and the
+    abstention / sigma fusion in :func:`predict_full`. Pass a ``conf_fn`` with
+    this same signature to swap in the learned bin-correctness head when it
+    lands — softmax-max is overconfident in the oblique band, exactly where both
+    the stitcher and abstention need a calibrated signal (docs/cliff_plan.md)."""
+    cu = torch.softmax(out[:nu].float(), dim=0).max(0).values
+    cv = torch.softmax(out[nu:nu + nv].float(), dim=0).max(0).values
+    return cu, cv
+
+
 @torch.no_grad()
 def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
                  device: str = "cpu", return_conf: bool = False,
-                 conf_per_axis: bool = False, return_sigma: bool = False):
+                 conf_per_axis: bool = False, return_sigma: bool = False,
+                 conf_fn=None):
     """Full-frame inference: capture (H, W) in [0,1] -> (H, W, 2) projector px,
     NaN where the validity head says the projector can't see the pixel.
 
@@ -535,6 +549,12 @@ def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
     head. For a non-heteroscedastic model ``sigma_offset=0`` so this degrades to a
     bin-flip-risk-only map. Use ``1/sigma**2`` to weight downstream triangulation /
     fusion; verify calibration with a reliability diagram before trusting it.
+
+    ``conf_fn`` overrides the confidence source (default :func:`_softmax_conf`):
+    a callable ``(out, nu, nv) -> (conf_u, conf_v)`` feeding BOTH the
+    ``return_conf`` map and the ``return_sigma`` ``p_bin`` term. Swap in the
+    learned bin-correctness head here so the abstention map and the tiled
+    seam-stitcher consume the same calibrated signal.
     """
     model.eval()
     nu, nv = N_BINS_U, N_BINS_V
@@ -552,8 +572,7 @@ def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
     uv = uv.float().cpu().numpy()
     if return_sigma:
         bu_px, bv_px = proj_wh[0] / nu, proj_wh[1] / nv
-        pu = torch.softmax(out[:nu].float(), dim=0).max(0).values       # P(bin right)
-        pv = torch.softmax(out[nu:nu + nv].float(), dim=0).max(0).values
+        pu, pv = (conf_fn or _softmax_conf)(out, nu, nv)                # P(bin right)
         if getattr(model, "hetero", False):
             su = out[nu + nv + 2].float().clamp(-10.0, 10.0)
             sv = out[nu + nv + 3].float().clamp(-10.0, 10.0)
@@ -568,8 +587,7 @@ def predict_full(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
         sig_v = torch.where(valid, torch.sqrt(var_v), nan).cpu().numpy()
         return uv, sig_u, sig_v
     if return_conf or conf_per_axis:
-        conf_u = torch.softmax(out[:nu].float(), dim=0).max(0).values
-        conf_v = torch.softmax(out[nu:nu + nv].float(), dim=0).max(0).values
+        conf_u, conf_v = (conf_fn or _softmax_conf)(out, nu, nv)
         if conf_per_axis:
             return uv, conf_u.cpu().numpy(), conf_v.cpu().numpy()
         conf = torch.minimum(conf_u, conf_v)             # joint correspondence conf
@@ -591,7 +609,7 @@ def _tile_positions(n: int, t: int, stride: int) -> list[int]:
 def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
                   device: str = "cpu", tile: int = 256, margin: int = 32,
                   overlap: int = 0, return_conf: bool = False,
-                  conf_per_axis: bool = False):
+                  conf_per_axis: bool = False, conf_fn=None):
     """Full-frame inference by stitching ``tile``x``tile`` predictions instead of
     running the whole frame at once.
 
@@ -613,8 +631,9 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
     - ``overlap>0``: **overlapping tiles + per-pixel max-confidence** — tiles run at
       ``stride = tile - overlap`` so every pixel is covered by several offset tiles, and
       each pixel keeps the prediction from whichever tile is most confident (and valid)
-      there. A tile's own edges have the least context -> lowest softmax confidence ->
-      they lose to a tile where the pixel is well-centred, so the seams dissolve. Larger
+      there. A tile's own edges have the least context -> lowest confidence (``conf_fn``,
+      softmax-max by default; see :func:`_softmax_conf`) -> they lose to a tile where the
+      pixel is well-centred, so the seams dissolve. Larger
       ``overlap`` = more candidates = smoother, at proportional cost (~(tile/stride)^2
       more forward passes).
 
@@ -634,7 +653,8 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
         for y in _tile_positions(H, t, stride):
             for x in _tile_positions(W, t, stride):
                 ruv, rcu, rcv = predict_full(model, img[y:y + t, x:x + t], proj_wh,
-                                             device=device, conf_per_axis=True)
+                                             device=device, conf_per_axis=True,
+                                             conf_fn=conf_fn)
                 # invalid (NaN uv) scores below any valid pixel, so a valid prediction
                 # from any tile always beats an abstaining one.
                 score = np.where(np.isfinite(ruv[..., 0]), np.minimum(rcu, rcv), -1.0)
@@ -658,7 +678,8 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
     for y in _tile_positions(H, t, stride):
         for x in _tile_positions(W, t, stride):
             r = predict_full(model, img[y:y + t, x:x + t], proj_wh, device=device,
-                             return_conf=return_conf, conf_per_axis=conf_per_axis)
+                             return_conf=return_conf, conf_per_axis=conf_per_axis,
+                             conf_fn=conf_fn)
             ruv = r[0] if n_extra else r
             rex = r[1:] if n_extra else ()
             top = 0 if y == 0 else margin
