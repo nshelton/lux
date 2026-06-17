@@ -281,26 +281,43 @@ def _gaussian_blur(img: np.ndarray, sigma: float) -> np.ndarray:
 
 
 def _augment_crop(ic: np.ndarray, rng) -> np.ndarray:
-    """Input-only train-time augmentation (target/validity untouched). All
-    probabilistic so sharp, clean crops still appear — otherwise blur/noise on
-    every crop would cap the subpixel ceiling. Stacks on top of the per-sample
-    render-time imperfections, re-randomised every crop/epoch: exposure
-    (gain+gamma), optical blur on a fraction, a high-contrast/highlight-clipped
-    capture regime on half (real projectors + autoexposure saturate highlights
-    that clean renders don't), additive sensor noise on most."""
-    ic = np.clip(ic * rng.uniform(0.7, 1.3), 0, 1) ** rng.uniform(0.8, 1.25)
-    if rng.random() < 0.4:                        # 4px cells survive sigma < ~1.5
-        ic = _gaussian_blur(ic, rng.uniform(0.4, 1.5))
-    if rng.random() < 0.5:
-        # High-contrast / clipped capture: stretch contrast about the crop mean
-        # and lift brightness so bright cells saturate (real captures clip ~4% of
-        # lit px vs ~0.5% in clean renders). Input-only -> correspondence unchanged;
-        # clipping is intentional so the net learns to place offsets despite it.
-        m = float(ic.mean())
-        ic = np.clip((ic - m) * rng.uniform(1.2, 2.2) + m + rng.uniform(0.0, 0.25), 0, 1)
-    if rng.random() < 0.7:
-        ic = ic + rng.normal(0.0, rng.uniform(0.005, 0.05), ic.shape)
-    return np.clip(ic, 0.0, 1.0).astype(np.float32)
+    """Input-only train-time augmentation (target/validity untouched): re-form the
+    (clean) render through a **physically-ordered camera image-formation model**, so
+    the degradations have the right *structure*, not just the right magnitude.
+
+    Order and signal-dependence matter — the old version did gain/gamma + flat
+    additive noise + blur as independent ops in arbitrary order, which is physically
+    wrong: real sensor noise is **shot-limited** (Poisson, std ∝ √signal), so bright
+    pattern dots are noisier than dark gaps, and optics blur *before* the sensor adds
+    noise, which clips *before* the response curve. Pipeline (≈linear radiance → 8-bit):
+
+        exposure gain → optical PSF (defocus) → shot noise (√signal, linear space)
+        → read noise → saturate/clip → response curve (gamma) → 8-bit quantize
+
+    The input crop is treated as ≈linear scene radiance (approximation — enough to
+    inject the right structure). All stages probabilistic so sharp/clean crops still
+    appear (else the subpixel ceiling caps). Parameterised wider than the old version.
+    """
+    x = ic.astype(np.float32)
+    x = x * rng.uniform(0.55, 1.6)                         # exposure / gain (linear)
+    if rng.random() < 0.55:                               # optical PSF: 4px cells survive σ<~1.6
+        x = _gaussian_blur(x, rng.uniform(0.4, 1.6))
+    if rng.random() < 0.85:
+        # shot (photon) noise — Poisson, in linear space: a pixel at fraction s of
+        # full well collects s·W photons, std √(s·W) photons = √(s/W) back in [0,1].
+        # So std ∝ √signal → bright pattern dots noisier than dark gaps (the structure
+        # a flat additive σ misses). Lower full_well = noisier capture.
+        full_well = rng.uniform(30.0, 500.0)
+        x = x + rng.standard_normal(x.shape).astype(np.float32) * np.sqrt(np.maximum(x, 0.0) / full_well)
+    if rng.random() < 0.8:                                # read noise — additive, signal-independent
+        x = x + rng.normal(0.0, rng.uniform(0.002, 0.025), x.shape).astype(np.float32)
+    # saturate / highlight clip: an exposure push blows some highlights to white
+    # (real captures clip ~4% of lit px vs ~0.5% in clean renders) — a hard clip at
+    # full well, *before* the response curve.
+    x = np.clip(x * rng.uniform(0.9, 1.35), 0.0, 1.0)
+    x = x ** rng.uniform(0.75, 1.35)                      # camera response curve (gamma / tone)
+    x = np.round(x * 255.0) / 255.0                       # 8-bit quantization
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
 
 
 class ProjSamples(Dataset):
@@ -610,7 +627,7 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
                   device: str = "cpu", tile: int = 256, margin: int = 32,
                   overlap: int = 0, return_conf: bool = False,
                   conf_per_axis: bool = False, conf_fn=None,
-                  select: str = "confidence"):
+                  select: str = "confidence", reflect: bool = False):
     """Full-frame inference by stitching ``tile``x``tile`` predictions instead of
     running the whole frame at once.
 
@@ -692,25 +709,34 @@ def predict_tiled(model: nn.Module, img: np.ndarray, proj_wh: tuple[int, int],
             return uv, np.minimum(cu, cv)
         return uv
 
-    # margin-crop stitch
+    # margin-crop stitch (deterministic — use this for the canonical metric; max-conf
+    # above is for output). reflect=True pads the frame by `margin` first, so the TRUE
+    # outer ring is decoded centrally too — otherwise the outermost margin-px come from a
+    # tile where they sit at the real frame edge, with no neighbour to centre them.
+    pad = margin if reflect else 0
+    src = np.pad(img, pad, mode="reflect") if pad else img
+    Hs, Ws = src.shape
     stride = max(1, t - 2 * margin)
-    uv = np.full((H, W, 2), np.nan, np.float32)
+    uv = np.full((Hs, Ws, 2), np.nan, np.float32)
     n_extra = 2 if conf_per_axis else (1 if return_conf else 0)
-    extra = [np.zeros((H, W), np.float32) for _ in range(n_extra)]
-    for y in _tile_positions(H, t, stride):
-        for x in _tile_positions(W, t, stride):
-            r = predict_full(model, img[y:y + t, x:x + t], proj_wh, device=device,
+    extra = [np.zeros((Hs, Ws), np.float32) for _ in range(n_extra)]
+    for y in _tile_positions(Hs, t, stride):
+        for x in _tile_positions(Ws, t, stride):
+            r = predict_full(model, src[y:y + t, x:x + t], proj_wh, device=device,
                              return_conf=return_conf, conf_per_axis=conf_per_axis,
                              conf_fn=conf_fn)
             ruv = r[0] if n_extra else r
             rex = r[1:] if n_extra else ()
             top = 0 if y == 0 else margin
             left = 0 if x == 0 else margin
-            bot = t if y + t == H else t - margin
-            right = t if x + t == W else t - margin
+            bot = t if y + t == Hs else t - margin
+            right = t if x + t == Ws else t - margin
             uv[y + top:y + bot, x + left:x + right] = ruv[top:bot, left:right]
             for buf, rr in zip(extra, rex):
                 buf[y + top:y + bot, x + left:x + right] = rr[top:bot, left:right]
+    if pad:
+        uv = uv[pad:pad + H, pad:pad + W]
+        extra = [e[pad:pad + H, pad:pad + W] for e in extra]
     if conf_per_axis:
         return uv, extra[0], extra[1]
     if return_conf:

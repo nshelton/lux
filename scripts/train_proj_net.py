@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader  # noqa: E402
 
 from lux.proj_net import (  # noqa: E402
     ProjUNet, ProjSamples, LoafSamples, ConcatLoaf, proj_loss, predict_full,
-    save_checkpoint, load_weights_compatible,
+    predict_tiled, save_checkpoint, load_weights_compatible,
 )
 
 
