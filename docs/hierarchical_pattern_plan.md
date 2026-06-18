@@ -310,6 +310,59 @@ it.) **Intermod re-checked on the rendered spectrum at operating amplitude:** 2f
 energy, none lands on a carrier; 2f grows with off-center bias (to ~0.067) but stays off-carrier → keep
 bias near-centered in Build 4 and re-run at the learned amplitudes.
 
+## 15. Build-4 render validation + matched-down gate (2026-06-17)
+
+**Build 4 closed (plumbing):** quad generator (frozen coprime ladder u={13,19,33,139} v={11,17,29,113})
++ continuous-phase decoder + CRT consensus vote run end-to-end. Pattern co-designed on the proxy,
+materialized (`patterns/codesign_learned/pat_00.png`), then the **production decoder render-trained**
+on 400 hemisphere planes (`train_quad_rendered.py`; coord-L1 dropped per ablation). Coarse-align
+converged 0.96/0.97. The verdict below is the gate, not the plumbing.
+
+**§9.5 render-trained, plane obliquity (quad-400, full-frame vote):** 91.6/91.2/83.7/63.0/**33.6%**
+bin-acc, med|du|✓bin **0.94/0.91/1.05/1.28/1.52px** (0-15…60-75°). Bounded subpixel across all bands.
+
+**§9.5 clutter (plane-trained decoder; split depth-edge vs shadow distance transforms):** depth edges
+are the dangerous failure — bin-acc collapses to 7.7% at the edge and the peak-margin **under-abstains**
+(acc@τ 10.4%, cov stays ~40% → confidently-wrong false consensus). Shadow boundaries more benign
+(22% bin-acc, abstention helps: acc@τ 33 vs 22 raw). Depth-edge under-abstention is the open vote bug.
+
+**Matched-down gate (the load-bearing experiment).** Trained the M-array decoder on the *identical*
+400-plane regime (bit-identical geometry via `add_marray_captures.py`; `train_marray_rendered.py`).
+First run used the quad's lr 3e-4 → **failed to converge** (5% bin-acc) — the M-array codebook needs
+lr 1e-3 and ~50k steps (the production "ep10≈91%" was 10 epochs on the *20k* loaf); the quad converged
+in 6k steps because coprime carriers need cheap *local demodulation*, not a global random codebook. Re-ran
+with the M-array's **own established recipe** (lr 1e-3, AMP, gate-offset 6, 120 epochs ≈ 24k steps).
+Three columns, same 160 poses, each decoder at its honest in-distribution decode (bin models **tiled**,
+quad full-frame — its native path; tiling would only lift the quad, so its column is conservative):
+
+| obliq | quad-400 (bin% · du✓bin) | M-array-400 matched | M-array-20k (newaug ref) |
+|---|---|---|---|
+| 0-15  | 91.6 · **0.94** | 69.5 · 7.17 | **99.4** · 0.22 |
+| 30-45 | 83.7 · **1.05** | 65.3 · 7.16 | **98.0** · 0.35 |
+| 45-60 | 63.0 · **1.28** | 57.5 · 7.16 | 78.1 · 1.11 |
+| 60-75 | **33.6 · 1.52** | 34.6 · 7.23 | 7.9 · 6.90 |
+
+**Finding 1 — the "4× grazing bin-acc" headline was a data-distribution artifact, not a pattern win.**
+Matched at 400 planes, quad and M-array **tie at grazing bin-acc (33.6 vs 34.6)**. The original
+33.6-vs-7.9 gap existed only because M-array-20k trained on *clutter*, never on grazing planes — train
+any decoder on hemisphere planes and grazing jumps 7.9→34.6. Coarse-unwrap survival at grazing is **not**
+intrinsically better for the coprime code; it is mostly training-distribution. **Retire the "cliff fix"
+framing.**
+
+**Finding 2 — the real, matched, durable advantage is subpixel precision + sample efficiency.** At
+identical data the quad dominates everywhere except grazing bin-acc: bounded **0.9–1.5px** vs M-array's
+flat **~7.2px** (and the 20k's 6.9px grazing blow-up). This is architectural: the bin+offset head's offset
+only trains above the 70% bin-acc gate, and M-array-400 stalled at *69.5%* frontal — just under it — so its
+offset never formed (flat 7px = bin-centering). The quad's continuous phase trains unwrap **and** subpixel
+jointly from step 0, no gate. And quad is far more sample-efficient (91.6 vs 69.5% frontal at 400).
+
+**Implication for the 40k:** spend it, but justify on **subpixel + sample-efficiency** (matched,
+architectural), NOT grazing bin-acc. The open question the 40k answers: *does coprime-CRT structure give a
+higher grazing bin-acc ceiling than an on-distribution M-array at scale?* At 400 they tie ~34%; the ceiling
+delta is unknown and is what the render settles. Next pass also: appearance-axis re-co-design (proxy used
+analytic carriers, not the quantized PNG — frontal 91 vs 99 and proxy-94→render-34 both point here) and the
+depth-edge under-abstention fix.
+
 ## 10. Risks
 
 - **Proxy-fidelity gap (biggest):** planar + synthetic shading ≠ Mitsuba; mitigated by the
