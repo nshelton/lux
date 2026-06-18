@@ -136,10 +136,13 @@ class ProjUNet(nn.Module):
     """
 
     def __init__(self, in_ch: int = 1, base: int = 32, mid: str = "conv",
-                 attn_layers: int = 4, heteroscedastic: bool = False):
+                 attn_layers: int = 4, heteroscedastic: bool = False,
+                 head: str = "cls", n_cu: int = 0, n_cv: int = 0):
         super().__init__()
         self.arch = mid
         self.hetero = heteroscedastic
+        self.head_mode = head            # 'cls' (bin+offset) or 'quad' (per-carrier cos/sin)
+        self.n_cu, self.n_cv = n_cu, n_cv
         c = [base, base * 2, base * 4, base * 8]
         self.enc = nn.ModuleList()
         prev = in_ch
@@ -155,7 +158,12 @@ class ProjUNet(nn.Module):
         for ci in reversed(c):
             self.dec.append(_Block(prev + ci, ci))
             prev = ci
-        head_ch = _HEAD_CH + (2 if heteroscedastic else 0)   # +logvar(off_u, off_v)
+        if head == "quad":
+            # per-carrier unnormalized (cos,sin) for u then v carriers, + validity logit (last).
+            # Floating magnitude = confidence (NOT normalized): the consensus-vote weight.
+            head_ch = 2 * (n_cu + n_cv) + 1
+        else:
+            head_ch = _HEAD_CH + (2 if heteroscedastic else 0)   # +logvar(off_u, off_v)
         self.head = nn.Conv2d(base, head_ch, 1)
         nn.init.zeros_(self.head.bias)   # logvar bias 0 -> sigma^2=1 -> NLL starts MSE-like
 

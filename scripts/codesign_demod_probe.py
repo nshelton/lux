@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Build 3: fixed-pattern demod probe (capacity gate). Render the FROZEN coprime carrier pattern
+through the faithful proxy (validated analytic anisotropic-Gaussian blur + grazing falloff + shot/
+read noise + 8-bit) and measure per-carrier per-pixel phase NOISE sigma_phi vs obliquity vs carrier
+count K. No generator loop, no vote tuning -- isolates "is the representation demodulable to the
+accuracy the vote needs" from "can co-design improve it."
+
+LOCAL demod (not a global-crop lstsq): each carrier is read by a windowed lock-in over its NATURAL
+scale (~3x its period) -- the dense per-pixel estimate a real decoder must produce, with realistic
+(not 256x-global) noise averaging and genuine cross-carrier leakage. This is the version that can
+FAIL: fine carriers (small window, dim grazing signal) blow the bar first (fine dies), coarse hold
+(coarse survives); close carriers leak into each other's lock-in (separability).
+
+Bar: sigma_phi < ~0.2 rad (margin below the vote's 0.3 rad breakdown; real errors are correlated).
+A carrier over the bar at an obliquity is dead there -> its floating magnitude zeros its vote.
+
+    python scripts/codesign_demod_probe.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from lux import codesign as cd
+
+W, H = 1920, 1080
+S = 512                                   # room for coarse-carrier windows + interior
+SIGMA_DEF, SIGMA_MTF = 1.0, 0.7           # rig-anchored: projector defocus_px, camera MTF
+FULL_WELL, READ = 200.0, 0.01
+GRAZE_FLOOR = 0.12
+
+
+def gen_for(periods, total_drive=1.5):
+    g = cd.PatternGenerator((W, H), n_carriers=len(periods))
+    with torch.no_grad():
+        g.log_freq.copy_(torch.log(torch.tensor([W / p for p in periods], dtype=torch.float32)))
+        g.theta.zero_(); g.phase.zero_()
+        g.log_amp.copy_(torch.log(torch.full((len(periods),), total_drive / len(periods))))
+        g.bias.zero_()
+    return g
+
+
+def render(gen, Hinv, th_deg, rng):
+    coords, _ = cd.grid_from_homography(Hinv, (S, S), "cpu", ss=1)
+    pat = gen.sample_at(coords[None], mtf=(SIGMA_MTF, SIGMA_DEF))[0, 0].detach().numpy()
+    falloff = max(np.cos(np.deg2rad(th_deg)), GRAZE_FLOOR)
+    sig = pat * falloff * rng.uniform(0.55, 1.0)
+    sig = sig + rng.standard_normal(sig.shape) * np.sqrt(np.clip(sig, 0, None) / FULL_WELL)
+    sig = sig + rng.standard_normal(sig.shape) * READ
+    sig = np.round(np.clip(sig, 0, 1) * 255) / 255
+    return sig, coords[..., 0].numpy() * W
+
+
+def _boxblur(x, win):                      # separable uniform filter (fast, O(N*win))
+    r = win // 2
+    kx = torch.ones(1, 1, win, 1) / win
+    ky = torch.ones(1, 1, 1, win) / win
+    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), kx)
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="reflect"), ky)
+    return x
+
+
+def local_phase(cap, u, period):
+    """Per-pixel lock-in phase for one carrier over a ~3x-period window. Returns the interior
+    phase field (radians), padding-contaminated border removed."""
+    win = int(np.clip(3 * period, 49, 193)) | 1               # odd
+    xi = 2 * np.pi * u / period
+    c = torch.tensor(np.cos(xi), dtype=torch.float32)[None, None]
+    s = torch.tensor(np.sin(xi), dtype=torch.float32)[None, None]
+    cap_t = torch.tensor(cap, dtype=torch.float32)[None, None]
+    I = _boxblur(cap_t * c, win)[0, 0]
+    Q = _boxblur(cap_t * s, win)[0, 0]
+    ph = torch.atan2(I, Q).numpy()
+    m = win                                                   # drop the window-contaminated border
+    return ph[m:-m, m:-m]
+
+
+def sigma_phi(periods, th, rng, n_homog=2, n_real=6):
+    """Per-carrier per-pixel phase noise: circular std across noise realizations (fixed geometry),
+    meaned over the interior, averaged over homographies."""
+    out = []
+    for _ in range(n_homog):
+        Hinv, _ = cd.sample_homography_inv(rng, (S, S), (th, th + 0.01))
+        per_real = [[local_phase(*render(gen_for(periods), Hinv, th, rng), p) for p in periods]
+                    for _ in range(n_real)]                   # [real][carrier] -> phase field
+        carr = []
+        for k in range(len(periods)):
+            stack = np.stack([per_real[r][k] for r in range(n_real)])     # (R, h, w)
+            mean = np.angle(np.exp(1j * stack).mean(0))
+            cstd = np.angle(np.exp(1j * (stack - mean))).std(0)           # per-pixel circular std
+            carr.append(float(np.mean(cstd)))
+        out.append(carr)
+    return np.mean(out, 0)
+
+
+def main():
+    rng = np.random.default_rng(0)
+    subsets = [[33, 139], [19, 33, 139], [13, 19, 33, 139]]
+    bands = [0, 50, 65, 75]
+    print(f"LOCAL per-pixel demod (window ~3x period). optics sigma_def {SIGMA_DEF} sigma_mtf "
+          f"{SIGMA_MTF}, full_well {FULL_WELL}, graze_floor {GRAZE_FLOOR}. Bar sigma_phi < 0.2 rad.")
+    for periods in subsets:
+        wins = [int(np.clip(3 * p, 49, 193)) | 1 for p in periods]
+        print(f"\n carriers {periods} (K={len(periods)}, amp {1.5/len(periods):.2f}, windows {wins}px):")
+        print(f"  {'obliq':>6} | " + " | ".join(f"p={p:<3d}" for p in periods))
+        for th in bands:
+            sig = sigma_phi(periods, th, rng)
+            cells = [f"{sig[i]:.3f}{'!' if sig[i] > 0.2 else ' '}" for i in range(len(periods))]
+            print(f"  {th:4d}deg | " + " | ".join(f"{c:>6}" for c in cells))
+    print("\n  '!' = over the 0.2 bar (dead -> magnitude zeros its vote). Fine carriers should blow")
+    print("  the bar first at grazing (fine dies); the coarse core should hold (coarse survives).")
+
+
+if __name__ == "__main__":
+    main()

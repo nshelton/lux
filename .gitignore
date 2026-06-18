@@ -9,4 +9,11 @@ checkpoints/
 *.egg-info/
 datasets
 evals/*/data
+evals/*/data_learned*
+evals/*/results_*
 captures
+runs/
+logs/
+codesign_samples/
+codesign_infer/
+results.html
