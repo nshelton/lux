@@ -349,19 +349,33 @@ any decoder on hemisphere planes and grazing jumps 7.9→34.6. Coarse-unwrap sur
 intrinsically better for the coprime code; it is mostly training-distribution. **Retire the "cliff fix"
 framing.**
 
-**Finding 2 — the real, matched, durable advantage is subpixel precision + sample efficiency.** At
-identical data the quad dominates everywhere except grazing bin-acc: bounded **0.9–1.5px** vs M-array's
-flat **~7.2px** (and the 20k's 6.9px grazing blow-up). This is architectural: the bin+offset head's offset
-only trains above the 70% bin-acc gate, and M-array-400 stalled at *69.5%* frontal — just under it — so its
-offset never formed (flat 7px = bin-centering). The quad's continuous phase trains unwrap **and** subpixel
-jointly from step 0, no gate. And quad is far more sample-efficient (91.6 vs 69.5% frontal at 400).
+**Finding 2 (qualified) — the matched subpixel win is regime-specific, not general; sample efficiency
+is general.** The first draft's "quad dominates subpixel" repeated Finding 1's mistake in reverse:
+it compared the quad only to M-array-400, which sits *below its 70% offset gate* (flat 7.2px =
+bin-centering, offset never formed) — a matched-down artifact, not a fair baseline. The gate-crossing
+comparison is column three, and it goes the other way: **M-array-20k beats the quad on easy/mid precision
+(0.22 vs 0.94px frontal, ~4×)**. So the quad is **not** a general precision winner. What survives matched
+is narrower and architectural: **subpixel boundedness in the regimes where the M-array's gated offset
+collapses** — at 60-75° quad **1.52px vs the well-trained 20k's 6.90px**. The bin+offset head only trains
+its offset above 70% bin-acc, so wherever bin-acc is low (grazing for *any* M-array; everywhere for the
+starved 400) the offset never forms and you get bin-centering. The quad's continuous phase has no gate, so
+its subpixel stays bounded into those regimes. So the grazing story doesn't vanish — it **moves from
+bin-acc (which ties) to subpixel boundedness (which the quad wins even vs the 20k)**. The
+**sample-efficiency** half is solid and general: 91.6 vs 69.5% frontal at 400 planes, ~6k vs ~24k steps —
+coprime local demod forms faster than a global codebook.
 
-**Implication for the 40k:** spend it, but justify on **subpixel + sample-efficiency** (matched,
-architectural), NOT grazing bin-acc. The open question the 40k answers: *does coprime-CRT structure give a
-higher grazing bin-acc ceiling than an on-distribution M-array at scale?* At 400 they tie ~34%; the ceiling
-delta is unknown and is what the render settles. Next pass also: appearance-axis re-co-design (proxy used
-analytic carriers, not the quantized PNG — frontal 91 vs 99 and proxy-94→render-34 both point here) and the
-depth-edge under-abstention fix.
+**Consistency — two open ceilings, not one settled win.** By the same matched-down logic, the subpixel
+*ceiling* is as open as the grazing-bin-acc one: at 400 the quad's 0.94px beats a crippled M-array but
+loses to the well-trained 20k's 0.22px. Whether quad-40k's easy-regime subpixel approaches ~0.22 *while
+keeping its grazing boundedness* is unknown. The 40k answers **two** ceilings — grazing bin-acc and
+easy-regime subpixel — not one.
+
+**Implication for the 40k:** still worth running, but the honest pitch is **sample-efficient +
+grazing-subpixel-bounded, exploratory on two ceilings** — *not* a confirmed win, and *not* a general
+precision or cliff-fix claim. Justify on sample efficiency (solid) plus the two open-ceiling questions. The
+**appearance-axis re-co-design** (proxy used analytic carriers, not the quantized PNG — frontal 91 vs 99
+and proxy-94→render-34 both point here) remains the likeliest single lever to actually move the quad's
+numbers; depth-edge under-abstention is the other open fix.
 
 ## 10. Risks
 
