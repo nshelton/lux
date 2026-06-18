@@ -32,6 +32,10 @@ from scripts.train_proj_net import auto_device  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--loaf", default=None, nargs="+",
+                    help="one or more memmapped loaf dirs (build_loaf); trains from the packed "
+                         "loaf instead of --data sample dirs. Multiple loaves -> ConcatLoaf (e.g. "
+                         "the clutter + planar production loaves, ~50/50 by their size ratio).")
     ap.add_argument("--data", default="evals/hemisphere/data_learned_train")
     ap.add_argument("--pattern-set", default="codesign_learned")
     ap.add_argument("--frame", default="cap_pat_00.png")
@@ -51,9 +55,17 @@ def main():
 
     gen = cd.PatternGenerator.ladder((1920, 1080), U_PERIODS, V_PERIODS)   # periods only; not trained
     proj_wh = gen.proj_wh
-    ds = ProjSamples(args.data, pattern_set=args.pattern_set, frame=args.frame,
-                     crop=args.crop, crops_per_sample=args.crops_per_sample, jitter=True)
-    print(f"rendered quad-train: {len(ds)} samples x {args.crops_per_sample} crops | "
+    if args.loaf:
+        from lux.proj_net import LoafSamples, ConcatLoaf
+        loaves = [LoafSamples(p, crop=args.crop, crops_per_sample=args.crops_per_sample, jitter=True)
+                  for p in args.loaf]
+        ds = loaves[0] if len(loaves) == 1 else ConcatLoaf(loaves)
+        src = f"loaf {args.loaf}"
+    else:
+        ds = ProjSamples(args.data, pattern_set=args.pattern_set, frame=args.frame,
+                         crop=args.crop, crops_per_sample=args.crops_per_sample, jitter=True)
+        src = args.data
+    print(f"rendered quad-train: {len(ds)} samples x {args.crops_per_sample} crops | src {src} | "
           f"u={U_PERIODS} v={V_PERIODS} | device {dev}", flush=True)
     model = ProjUNet(base=32, head="quad", n_cu=len(U_PERIODS), n_cv=len(V_PERIODS)).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)

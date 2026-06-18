@@ -17,3 +17,8 @@ logs/
 codesign_samples/
 codesign_infer/
 results.html
+
+# codesign_v2 production data — large, transfer to the training box out-of-band (not git)
+loaves/
+evals/clutter_v2/
+evals/*/data_v2*

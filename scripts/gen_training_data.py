@@ -158,8 +158,40 @@ def _center_sampler(rng: np.random.Generator, cam_blk: dict | None,
     return draw
 
 
+def _sample_hemi_scene(rng: np.random.Generator, n_objects: int | None = None) -> dict:
+    """Origin-centred cluttered scene for **hemisphere-posed** rigs: a LARGE ground plane through the
+    origin (fills the frame from any pose, like the planar set's slabs, so an independently-posed
+    camera + projector both see it) with mixed boxes/spheres scattered near the origin on/above it.
+    The big plane gives dense supervision + the eval-matching surface obliquity; the objects give the
+    depth/occlusion edges. Mirrors the frustum-filling trick of ``sample_planar_scene``."""
+    if n_objects is None:
+        n_objects = int(rng.integers(4, 19))
+    H = 25.0                                              # ground half-extent (overflows any frustum)
+    if rng.random() < 0.7:                                # flat ground at z=0
+        ground = _with_surface({"type": "plane", "z": 0.0, "scale": H}, rng, lo=0.5)
+    else:                                                 # gently tilted big plane (thin rotated box)
+        ground = _with_surface({"type": "box", "center": [0.0, 0.0, 0.0], "scale": [H, H, 0.002],
+                                "rotation": [round(rng.uniform(-20, 20), 1),
+                                             round(rng.uniform(-20, 20), 1),
+                                             round(rng.uniform(0, 360), 1)]}, rng, lo=0.5)
+    objects = [ground]
+    R = 0.3                                               # object centres within +/-R of the origin
+    for _ in range(n_objects):
+        cx, cy = round(rng.uniform(-R, R), 3), round(rng.uniform(-R, R), 3)
+        if rng.random() < 0.65:
+            s = [round(_log_uniform(rng, 0.03, 0.16), 4) for _ in range(3)]
+            obj = {"type": "box", "center": [cx, cy, round(rng.uniform(0.0, 0.35) + s[2], 3)],
+                   "scale": s, "rotation": [round(rng.uniform(0, 360), 1) for _ in range(3)]}
+        else:
+            r = round(_log_uniform(rng, 0.03, 0.11), 4)
+            obj = {"type": "sphere", "center": [cx, cy, round(rng.uniform(0.0, 0.35) + r, 3)], "radius": r}
+        objects.append(_with_surface(obj, rng))
+    return {"name": "hemi_clutter_scene", "objects": objects,
+            "ambient": round(rng.uniform(0.05, 0.15), 3)}
+
+
 def sample_scene(rng: np.random.Generator, n_objects: int | None = None,
-                 cam_blk: dict | None = None) -> dict:
+                 cam_blk: dict | None = None, origin_centered: bool = False) -> dict:
     """A random interior-scale scene: background 2-5 m down the view axis, a
     variable count of mixed objects floating 1 m to background in front.
 
@@ -168,7 +200,12 @@ def sample_scene(rng: np.random.Generator, n_objects: int | None = None,
     Sizes scale with the sampled camera depth so angular (pixel) size stays
     distance-independent. ``cam_blk`` (the sampled rig's camera block) drives
     the frustum placement so every object lands in view.
+
+    ``origin_centered=True`` (for hemisphere-posed rigs) instead builds an origin-centred big-ground-
+    plane scene (:func:`_sample_hemi_scene`) so an independently-posed cam+proj both see the surface.
     """
+    if origin_centered:
+        return _sample_hemi_scene(rng, n_objects)
     if n_objects is None:
         n_objects = int(rng.integers(4, 19))
     bg_dist = round(rng.uniform(2.0, 5.0), 3)    # background distance from camera
@@ -189,27 +226,87 @@ def sample_scene(rng: np.random.Generator, n_objects: int | None = None,
             "ambient": round(rng.uniform(0.05, 0.15), 3)}
 
 
+# --------------------------------------------------------------------------
+# Hemisphere pose sampling (shared with gen_planar_dataset, which imports these)
+# --------------------------------------------------------------------------
+def _tilt_deg(rng: np.random.Generator, max_tilt: float, grazing_frac: float) -> float:
+    """Off-normal tilt in degrees. With prob ``grazing_frac`` draw from the cliff band
+    ``[45, max_tilt]`` (oversampling grazing), else uniform ``[0, max_tilt]``."""
+    if grazing_frac > 0.0 and rng.random() < grazing_frac:
+        return float(rng.uniform(min(45.0, max_tilt), max_tilt))
+    return float(rng.uniform(0.0, max_tilt))
+
+
+def _hemisphere_dir(rng: np.random.Generator, max_tilt_deg: float,
+                    grazing_frac: float = 0.0) -> np.ndarray:
+    """A unit direction on the +Z hemisphere: azimuth uniform in [0, 2pi), tilt off the +Z
+    normal per :func:`_tilt_deg` (uniform tilt, optionally grazing-oversampled)."""
+    phi = rng.uniform(0.0, 2.0 * np.pi)
+    theta = np.radians(_tilt_deg(rng, max_tilt_deg, grazing_frac))
+    st = np.sin(theta)
+    return np.array([st * np.cos(phi), st * np.sin(phi), np.cos(theta)])
+
+
+def _rolled_up(rng: np.random.Generator, forward: np.ndarray) -> np.ndarray:
+    """A world up-vector giving a uniformly random roll about ``forward`` (image-top direction)."""
+    f = forward / np.linalg.norm(forward)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(f[2]) < 0.99 else np.array([0.0, 1.0, 0.0])
+    right = np.cross(ref, f)
+    right /= np.linalg.norm(right)
+    up0 = np.cross(right, f)                      # right-handed up, perp to f
+    a = rng.uniform(0.0, 2.0 * np.pi)
+    return np.cos(a) * up0 + np.sin(a) * right
+
+
+def _hemi_pose(rng: np.random.Generator, max_tilt: float, dmin: float, dmax: float,
+               grazing_frac: float):
+    """A camera/projector centre on the +Z hemisphere aimed at the origin, with random roll.
+    Returns ``(centre, up)``; tilt oversamples grazing per ``grazing_frac``."""
+    n = _hemisphere_dir(rng, max_tilt, grazing_frac)
+    C = rng.uniform(dmin, dmax) * n
+    return C, _rolled_up(rng, -C)
+
+
 def sample_rig(rng: np.random.Generator, width: int, height: int,
-               cam_distort: bool = False) -> dict:
-    """A posed rig: camera jittered around (0, 0, -1m) aimed near the origin,
-    projector offset by a random (sign-flipped) baseline, FOVs varied, then
-    probabilistic lens/sensor imperfections layered on by ``add_rig_imperfections``.
-    """
-    cam_pos = [round(rng.uniform(-0.15, 0.15), 3),
-               round(rng.uniform(-0.15, 0.15), 3),
-               round(-rng.uniform(0.85, 1.25), 3)]
-    target = [round(rng.uniform(-0.08, 0.08), 3),
-              round(rng.uniform(-0.08, 0.08), 3), 0.0]
-    baseline = rng.uniform(0.15, 0.35) * rng.choice([-1.0, 1.0])
-    proj_pos = [round(cam_pos[0] + baseline, 3),
-                round(cam_pos[1] + rng.uniform(-0.12, 0.12), 3),
-                round(cam_pos[2] + rng.uniform(-0.1, 0.1), 3)]
-    camera = {"width": width, "height": height,
-              "hfov_deg": round(rng.uniform(38.0, 55.0), 2),
-              "position": cam_pos, "look_at": target, "up": [0.0, -1.0, 0.0]}
-    projector = {"width": 1920, "height": 1080,
-                 "hfov_deg": round(rng.uniform(35.0, 50.0), 2),
-                 "position": proj_pos, "look_at": target, "up": [0.0, -1.0, 0.0]}
+               cam_distort: bool = False, independent_proj: bool = False,
+               grazing_frac: float = 0.0, max_tilt: float = 0.0,
+               dmin: float = 0.9, dmax: float = 2.0) -> dict:
+    """A posed rig aimed near the origin, then probabilistic lens/sensor imperfections layered on.
+
+    Default (``max_tilt=0``, no flags): the legacy near-frontal rig -- camera jittered around
+    (0,0,-1m), projector at a small fixed baseline. With ``max_tilt>0`` the camera is posed on the
+    hemisphere (tilt oversampled toward grazing per ``grazing_frac``); with ``independent_proj`` the
+    projector is posed independently on the hemisphere too, so ``max(cam,proj)`` obliquity skews
+    toward grazing the way the hemisphere eval does (instead of proj~cam). The scene is built in the
+    camera frustum by the caller, so it follows whatever pose the camera takes."""
+    up_p = None
+    if independent_proj or grazing_frac > 0.0 or max_tilt > 0.0:
+        cam_C, up = _hemi_pose(rng, max(max_tilt, 1.0), dmin, dmax, grazing_frac)
+        if independent_proj:
+            proj_C, up_p = _hemi_pose(rng, max(max_tilt, 1.0), dmin, dmax, grazing_frac)
+        else:                                          # rigid baseline along the camera's right axis
+            f = -cam_C / np.linalg.norm(cam_C)
+            y = (up @ f) * f - up; y /= np.linalg.norm(y); right = np.cross(y, f)
+            baseline = rng.uniform(0.15, 0.35) * rng.choice([-1.0, 1.0])
+            proj_C = (cam_C + baseline * right + rng.uniform(-0.08, 0.08) * y
+                      + rng.uniform(-0.06, 0.06) * f)
+        target = [round(rng.uniform(-0.08, 0.08), 3), round(rng.uniform(-0.08, 0.08), 3), 0.0]
+        cam_pos = [round(float(x), 4) for x in cam_C]
+        proj_pos = [round(float(x), 4) for x in proj_C]
+        up = [round(float(x), 4) for x in up]
+        up_p = up if up_p is None else [round(float(x), 4) for x in up_p]
+    else:                                              # legacy near-frontal rig (original draw order)
+        cam_pos = [round(rng.uniform(-0.15, 0.15), 3), round(rng.uniform(-0.15, 0.15), 3),
+                   round(-rng.uniform(0.85, 1.25), 3)]
+        target = [round(rng.uniform(-0.08, 0.08), 3), round(rng.uniform(-0.08, 0.08), 3), 0.0]
+        baseline = rng.uniform(0.15, 0.35) * rng.choice([-1.0, 1.0])
+        proj_pos = [round(cam_pos[0] + baseline, 3), round(cam_pos[1] + rng.uniform(-0.12, 0.12), 3),
+                    round(cam_pos[2] + rng.uniform(-0.1, 0.1), 3)]
+        up = up_p = [0.0, -1.0, 0.0]
+    camera = {"width": width, "height": height, "hfov_deg": round(rng.uniform(38.0, 55.0), 2),
+              "position": cam_pos, "look_at": target, "up": up}
+    projector = {"width": 1920, "height": 1080, "hfov_deg": round(rng.uniform(35.0, 50.0), 2),
+                 "position": proj_pos, "look_at": target, "up": up_p}
     rig = {"name": "random_rig", "camera": camera, "projector": projector}
     return add_rig_imperfections(rig, rng, cam_distort=cam_distort)
 
@@ -317,8 +414,11 @@ def _render_one(i: int, args) -> str:
     scene_path, rig_path = Path(sdir, "scene.json"), Path(sdir, "rig.json")
     # Rig first: the scene sampler rejection-tests object centres against the
     # sampled camera frustum so nothing lands out of view.
-    rig_spec = sample_rig(rng, args.width, args.height, cam_distort=args.cam_distort)
-    scene = sample_scene(rng, args.objects, cam_blk=rig_spec["camera"])
+    rig_spec = sample_rig(rng, args.width, args.height, cam_distort=args.cam_distort,
+                          independent_proj=args.independent_proj, grazing_frac=args.grazing_frac,
+                          max_tilt=args.max_tilt)
+    hemi = args.max_tilt > 0.0 or args.independent_proj   # origin-centred scene for hemisphere rigs
+    scene = sample_scene(rng, args.objects, cam_blk=rig_spec["camera"], origin_centered=hemi)
     rig_path.write_text(json.dumps(rig_spec, indent=2) + "\n")
     scene_path.write_text(json.dumps(scene, indent=2) + "\n")
 
@@ -354,6 +454,15 @@ def main() -> None:
     ap.add_argument("--cam-distort", action="store_true",
                     help="also randomize camera lens distortion (warps captures out of "
                          "the ideal image space GT lives in; undistort downstream)")
+    ap.add_argument("--max-tilt", type=float, default=0.0,
+                    help="max rig tilt off the scene's frontal axis, degrees (0 = legacy "
+                         "near-frontal rig; >0 = hemisphere-posed camera, covering oblique views)")
+    ap.add_argument("--independent-proj", action="store_true",
+                    help="pose the projector independently on the hemisphere (not rigidly offset "
+                         "from the camera), so max(cam,proj) obliquity matches the hemisphere eval")
+    ap.add_argument("--grazing-frac", type=float, default=0.0,
+                    help="fraction of camera/projector poses drawn from the >=45 deg cliff band "
+                         "(oversamples grazing; requires --max-tilt)")
     ap.add_argument("--lean", action="store_true",
                     help="skip human-facing extras (gt_cloud.ply, montage, gt_proj.png, "
                          "albedo.png) - keeps gt_depth/gt_proj/white/captures only")
@@ -362,13 +471,20 @@ def main() -> None:
                          "skip them, so an interrupted run resumes where it stopped)")
     ap.add_argument("--jobs", type=int, default=1,
                     help="parallel worker processes (samples are independent)")
+    ap.add_argument("--maxtasks", type=int, default=8,
+                    help="recycle each worker process after this many samples. The NumPy "
+                         "ray-caster's peak RSS is not returned to the OS, so a long-lived pool "
+                         "worker ratchets to multi-GB and (xN jobs) OOMs the box; recycling resets it.")
     ap.add_argument("--out", default="renders/train")
     args = ap.parse_args()
 
     if args.jobs > 1:
-        from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
-            results = list(ex.map(_render_one, range(args.n), [args] * args.n))
+        from multiprocessing import Pool
+        from functools import partial
+        # maxtasksperchild bounds memory: a recycled worker frees its NumPy high-water-mark
+        # RSS back to the OS. imap_unordered streams (progress + low driver memory).
+        with Pool(processes=args.jobs, maxtasksperchild=args.maxtasks) as pool:
+            results = list(pool.imap_unordered(partial(_render_one, args=args), range(args.n)))
     else:
         results = [_render_one(i, args) for i in range(args.n)]
 

@@ -136,6 +136,11 @@ def main():
     ap.add_argument("--coord-ramp", type=int, default=400, help="coord-L1 warmup steps after gate")
     ap.add_argument("--sigma-mtf", type=float, default=0.7)
     ap.add_argument("--sigma-def", type=float, default=1.0)
+    ap.add_argument("--appearance", choices=["raster", "analytic"], default="raster",
+                    help="raster: appearance-fixed proxy (materialize -> 8-bit quantize -> "
+                         "grid_sample = the renderer's quantized/resampled appearance, optics as "
+                         "proj-defocus blur + camera-MTF base_psf + footprint-ss anisotropy); "
+                         "analytic: pre-fix continuous-carrier eval with per-carrier MTF (old proxy)")
     ap.add_argument("--eval-per-band", type=int, default=6)
     ap.add_argument("--device", default=auto_device())
     ap.add_argument("--out", default="checkpoints/codesign_quad.pt")
@@ -168,15 +173,27 @@ def main():
 
     gen = cd.PatternGenerator.ladder(proj_wh, U_PERIODS, V_PERIODS, seed=args.seed).to(dev)
     model = ProjUNet(base=32, head="quad", n_cu=len(U_PERIODS), n_cv=len(V_PERIODS)).to(dev)
-    batcher = cd.ProxyBatcher(proj_wh, crop=args.crop, device=dev, obliq_deg=(0, 78), seed=args.seed)
-    bank = cd.EvalBank(lambda c: gen.sample_at(c, mtf=mtf), proj_wh, per_band=args.eval_per_band,
-                       device=dev)
+    if args.appearance == "raster":
+        # appearance-fixed: sample the quantized pattern raster via grid_sample; optics split into
+        # projector-defocus blur (inside pat_at), camera-MTF base_psf, and footprint-ss anisotropy.
+        pat_at = cd.raster_appearance(gen, sigma_def=args.sigma_def)
+        batcher = cd.ProxyBatcher(proj_wh, crop=args.crop, device=dev, obliq_deg=(0, 78),
+                                  seed=args.seed, ss=4, base_psf=args.sigma_mtf, grazing_floor=0.12)
+        bank = cd.EvalBank(pat_at, proj_wh, per_band=args.eval_per_band, device=dev,
+                           ss=4, base_psf=args.sigma_mtf)
+        sample_kw = {}
+    else:
+        pat_at = gen.sample_at
+        batcher = cd.ProxyBatcher(proj_wh, crop=args.crop, device=dev, obliq_deg=(0, 78), seed=args.seed)
+        bank = cd.EvalBank(lambda c: gen.sample_at(c, mtf=mtf), proj_wh, per_band=args.eval_per_band,
+                           device=dev)
+        sample_kw = {"mtf": mtf}
     opt = torch.optim.AdamW([{"params": model.parameters(), "lr": args.lr, "weight_decay": 1e-4},
                              {"params": [p for p in gen.parameters() if p.requires_grad],
                               "lr": args.gen_lr, "weight_decay": 0.0}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    print(f"co-design: u={U_PERIODS} v={V_PERIODS} | quad head {2*(len(U_PERIODS)+len(V_PERIODS))+1}ch | "
-          f"device {dev}", flush=True)
+    print(f"co-design[{args.appearance}]: u={U_PERIODS} v={V_PERIODS} | quad head "
+          f"{2*(len(U_PERIODS)+len(V_PERIODS))+1}ch | device {dev}", flush=True)
 
     gstep = 0
     gate_step = None
@@ -186,7 +203,7 @@ def main():
         w_loss = w_cl = 0.0
         last_cu = last_cv = 0.0
         for k in range(1, args.steps_per_epoch + 1):
-            cap, target, valid = batcher.sample(args.batch, gen.sample_at, mtf=mtf)
+            cap, target, valid = batcher.sample(args.batch, pat_at, **sample_kw)
             pred = model(cap)
             loss, ua, va, bce = cd.quad_loss(pred, target, valid, gen, proj_wh,
                                              carrier_weights=carrier_weights(gstep, args.ramp))

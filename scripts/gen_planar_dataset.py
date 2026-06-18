@@ -42,36 +42,13 @@ import numpy as np  # noqa: E402
 from lux import io  # noqa: E402
 
 from gen_training_data import (  # noqa: E402
-    add_rig_imperfections, render_sample, _with_surface,
+    add_rig_imperfections, render_sample, _with_surface, _hemi_pose,
 )
 
 
 # --------------------------------------------------------------------------
-# Pose / geometry sampling
+# Pose / geometry sampling  (hemisphere-pose helpers live in gen_training_data)
 # --------------------------------------------------------------------------
-def _hemisphere_dir(rng: np.random.Generator, max_tilt_deg: float) -> np.ndarray:
-    """A unit direction on the +Z hemisphere: azimuth uniform in [0, 2pi), tilt
-    uniform in [0, max_tilt] off the +Z normal (uniform tilt, not area-uniform,
-    so grazing views are sampled as densely as head-on ones)."""
-    phi = rng.uniform(0.0, 2.0 * np.pi)
-    theta = np.radians(rng.uniform(0.0, max_tilt_deg))
-    st = np.sin(theta)
-    return np.array([st * np.cos(phi), st * np.sin(phi), np.cos(theta)])
-
-
-def _rolled_up(rng: np.random.Generator, forward: np.ndarray) -> np.ndarray:
-    """A world up-vector giving a uniformly random roll about ``forward``. ``up``
-    is the world direction that lands at image-top, so rolling it around the
-    optical axis rolls the image (covers every in-image orientation)."""
-    f = forward / np.linalg.norm(forward)
-    ref = np.array([0.0, 0.0, 1.0]) if abs(f[2]) < 0.99 else np.array([0.0, 1.0, 0.0])
-    right = np.cross(ref, f)
-    right /= np.linalg.norm(right)
-    up0 = np.cross(right, f)                      # right-handed up, perp to f
-    a = rng.uniform(0.0, 2.0 * np.pi)
-    return np.cos(a) * up0 + np.sin(a) * right
-
-
 def sample_planar_scene(rng: np.random.Generator,
                         min_dihedral: float = 8.0,
                         max_dihedral: float = 30.0) -> dict:
@@ -106,29 +83,33 @@ def sample_planar_scene(rng: np.random.Generator,
 
 def sample_planar_rig(rng: np.random.Generator, width: int, height: int,
                       dmin: float, dmax: float, max_tilt: float,
-                      cam_distort: bool = False) -> dict:
-    """A posed rig over the plane's hemisphere: camera at a random hemisphere
-    direction * random distance, looking at the plane centre with random roll;
-    projector offset along the camera's right axis by a random baseline. Then
-    the shared probabilistic lens/sensor imperfections are layered on."""
-    n = _hemisphere_dir(rng, max_tilt)
-    d = rng.uniform(dmin, dmax)
-    cam_C = d * n                                  # plane centre is the origin
-    forward = -cam_C                              # aim back at the plane centre
-    up = _rolled_up(rng, forward)
-
-    # camera world basis (rows: right, down, forward) -> offset the projector
-    # along the camera's own right axis so the baseline is sensible at any pose.
-    f = forward / np.linalg.norm(forward)
-    y = (up @ f) * f - up
-    y /= np.linalg.norm(y)
-    right = np.cross(y, f)
-    baseline = rng.uniform(0.15, 0.35) * rng.choice([-1.0, 1.0])
-    proj_C = (cam_C + baseline * right
-              + rng.uniform(-0.08, 0.08) * y          # small vertical jitter
-              + rng.uniform(-0.06, 0.06) * f)         # small in/out jitter
-
+                      cam_distort: bool = False, independent_proj: bool = False,
+                      grazing_frac: float = 0.0) -> dict:
+    """A posed rig over the plane's hemisphere: camera at a random hemisphere direction *
+    random distance, looking at the plane centre with random roll. The projector either
+    rides rigidly with the camera (``independent_proj=False``: baseline offset along the
+    camera's right axis -- a fixed SL rig) or is posed **independently** on the hemisphere
+    (``independent_proj=True``: its own tilt/azimuth/distance, like the hemisphere eval --
+    so ``max(cam,proj)`` obliquity skews toward grazing the way the eval does, instead of
+    proj~cam). ``grazing_frac`` oversamples the >=45 deg cliff band. Then the shared
+    probabilistic lens/sensor imperfections are layered on."""
     target = [0.0, 0.0, 0.0]
+    cam_C, up = _hemi_pose(rng, max_tilt, dmin, dmax, grazing_frac)
+
+    if independent_proj:
+        proj_C, up_p = _hemi_pose(rng, max_tilt, dmin, dmax, grazing_frac)
+    else:
+        # rigid pair: offset the projector along the camera's own right axis.
+        f = -cam_C / np.linalg.norm(cam_C)
+        y = (up @ f) * f - up
+        y /= np.linalg.norm(y)
+        right = np.cross(y, f)
+        baseline = rng.uniform(0.15, 0.35) * rng.choice([-1.0, 1.0])
+        proj_C = (cam_C + baseline * right
+                  + rng.uniform(-0.08, 0.08) * y          # small vertical jitter
+                  + rng.uniform(-0.06, 0.06) * f)         # small in/out jitter
+        up_p = up
+
     camera = {"width": width, "height": height,
               "hfov_deg": round(rng.uniform(38.0, 55.0), 2),
               "position": [round(float(x), 4) for x in cam_C],
@@ -136,7 +117,7 @@ def sample_planar_rig(rng: np.random.Generator, width: int, height: int,
     projector = {"width": 1920, "height": 1080,
                  "hfov_deg": round(rng.uniform(35.0, 50.0), 2),
                  "position": [round(float(x), 4) for x in proj_C],
-                 "look_at": target, "up": [round(float(x), 4) for x in up]}
+                 "look_at": target, "up": [round(float(x), 4) for x in up_p]}
     rig = {"name": "planar_rig", "camera": camera, "projector": projector}
     return add_rig_imperfections(rig, rng, cam_distort=cam_distort)
 
@@ -155,7 +136,9 @@ def _render_one(i: int, args) -> str:
     io.ensure_dir(sdir)
     scene_path, rig_path = Path(sdir, "scene.json"), Path(sdir, "rig.json")
     rig_spec = sample_planar_rig(rng, args.width, args.height, args.dmin, args.dmax,
-                                 args.max_tilt, cam_distort=args.cam_distort)
+                                 args.max_tilt, cam_distort=args.cam_distort,
+                                 independent_proj=args.independent_proj,
+                                 grazing_frac=args.grazing_frac)
     scene = sample_planar_scene(rng, args.min_dihedral, args.max_dihedral)
     rig_path.write_text(json.dumps(rig_spec, indent=2) + "\n")
     scene_path.write_text(json.dumps(scene, indent=2) + "\n")
@@ -190,6 +173,14 @@ def main() -> None:
     ap.add_argument("--max-tilt", type=float, default=75.0,
                     help="max camera tilt off the plane normal, degrees (0 = head-on, "
                          "90 = grazing); samples uniformly in [0, max-tilt]")
+    ap.add_argument("--independent-proj", action="store_true",
+                    help="pose the projector independently on the hemisphere (its own "
+                         "tilt/azimuth/distance) instead of riding rigidly with the camera. "
+                         "Matches the hemisphere eval's pose structure, so max(cam,proj) "
+                         "obliquity skews toward grazing the way the eval does.")
+    ap.add_argument("--grazing-frac", type=float, default=0.0,
+                    help="fraction of camera/projector poses drawn from the >=45 deg cliff "
+                         "band (oversamples grazing to over-weight the hard regime)")
     ap.add_argument("--min-dihedral", type=float, default=8.0,
                     help="min crease (dihedral) angle between the two planes, degrees")
     ap.add_argument("--max-dihedral", type=float, default=30.0,
@@ -206,13 +197,20 @@ def main() -> None:
                          "(default: skip, so an interrupted run resumes)")
     ap.add_argument("--jobs", type=int, default=1,
                     help="parallel worker processes (samples are independent)")
+    ap.add_argument("--maxtasks", type=int, default=8,
+                    help="recycle each worker process after this many samples. The NumPy "
+                         "ray-caster's peak RSS is not returned to the OS, so a long-lived pool "
+                         "worker ratchets to multi-GB and (xN jobs) OOMs the box; recycling resets it.")
     ap.add_argument("--out", default="renders/planar")
     args = ap.parse_args()
 
     if args.jobs > 1:
-        from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
-            results = list(ex.map(_render_one, range(args.n), [args] * args.n))
+        from multiprocessing import Pool
+        from functools import partial
+        # maxtasksperchild bounds memory: a recycled worker frees its NumPy high-water-mark
+        # RSS back to the OS. imap_unordered streams (progress + low driver memory).
+        with Pool(processes=args.jobs, maxtasksperchild=args.maxtasks) as pool:
+            results = list(pool.imap_unordered(partial(_render_one, args=args), range(args.n)))
     else:
         results = [_render_one(i, args) for i in range(args.n)]
 

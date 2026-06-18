@@ -104,6 +104,16 @@ def _isect_box(o, d, p: Box):
     return t, n, hit
 
 
+def _wavy_f(p: Wavy, x, y):
+    """Heightfield value ONLY (no partials). ``f = cz + amp·sin(thx)·sin(thy)`` needs just the
+    two sines, vs the four transcendentals (sin+cos of both) :func:`_wavy_fields` computes for the
+    gradient. The bracket + bisection only need ``f``, so this halves their transcendental cost
+    with bit-identical ``f``; Newton + the final normal still use :func:`_wavy_fields`."""
+    thx = 2 * np.pi * p.fx * (x - p.cx) / p.ex + p.px
+    thy = 2 * np.pi * p.fy * (y - p.cy) / p.ey + p.py
+    return p.cz + p.amp * np.sin(thx) * np.sin(thy)
+
+
 def _wavy_fields(p: Wavy, x, y):
     """Heightfield f and its x/y partials at world (x, y)."""
     thx = 2 * np.pi * p.fx * (x - p.cx) / p.ex + p.px
@@ -120,8 +130,7 @@ def _isect_wavy(o, d, p: Wavy):
     dx, dy, dz = d[..., 0], d[..., 1], d[..., 2]
 
     def g(t):  # residual z(t) - f(x(t), y(t)); broadcasts over any trailing t axis
-        f, _, _ = _wavy_fields(p, o[0] + t * dx, o[1] + t * dy)
-        return (o[2] + t * dz) - f
+        return (o[2] + t * dz) - _wavy_f(p, o[0] + t * dx, o[1] + t * dy)
 
     # z(t) = o.z + t·d.z sweeps the bounded band [cz-amp, cz+amp]; the root lives
     # in that t-interval (z linear, f bounded), with g(t_lo)<=0<=g(t_hi).
@@ -131,17 +140,35 @@ def _isect_wavy(o, d, p: Wavy):
     t_lo = np.minimum(tA, tB)
     t_hi = np.maximum(tA, tB)
 
-    # Sample the band to bracket the *nearest* root (first sign change).
+    # Sample the band to bracket the *nearest* root (first sign change). Done in pixel
+    # CHUNKS: a full-frame (H, W, N) sample stack at N=64 is ~13 GB (x~12 temporaries inside
+    # `_wavy_fields`) -- it dominated render memory and OOM'd parallel workers. Chunking caps the
+    # (chunk, N) intermediates to a few hundred MB with BIT-IDENTICAL output; the bisection/Newton
+    # below run on the cheap (H, W) lo/hi, so they (and the GT-exactness) are untouched.
     N = 64
     s = np.linspace(0.0, 1.0, N)
-    ts = t_lo[..., None] + (t_hi - t_lo)[..., None] * s          # (..., N)
-    f_stack, _, _ = _wavy_fields(p, o[0] + ts * dx[..., None], o[1] + ts * dy[..., None])
-    gs = (o[2] + ts * dz[..., None]) - f_stack
-    change = (gs[..., :-1] <= 0) & (gs[..., 1:] > 0)
-    has = change.any(axis=-1)
-    idx = np.argmax(change, axis=-1)
-    lo = np.take_along_axis(ts, idx[..., None], axis=-1)[..., 0]
-    hi = np.take_along_axis(ts, (idx + 1)[..., None], axis=-1)[..., 0]
+    shp = t_lo.shape
+    fl_lo, fl_hi = np.ravel(t_lo), np.ravel(t_hi)
+    fdx, fdy, fdz = np.ravel(dx), np.ravel(dy), np.ravel(dz)
+    # origin may be a scalar centre (camera/projector) or a per-pixel field (origin-generalised
+    # shadow rays); broadcast either to the flat pixel axis.
+    fox, foy, foz = (np.broadcast_to(o[k], shp).reshape(-1) for k in range(3))
+    M = fl_lo.shape[0]
+    lo = np.empty(M, t_lo.dtype); hi = np.empty(M, t_lo.dtype); has = np.empty(M, bool)
+    CHUNK = 65536
+    for c0 in range(0, M, CHUNK):
+        sl = slice(c0, min(c0 + CHUNK, M))
+        tl = fl_lo[sl][:, None]
+        ts = tl + (fl_hi[sl][:, None] - tl) * s                  # (m, N)
+        fc = _wavy_f(p, fox[sl][:, None] + ts * fdx[sl][:, None],
+                     foy[sl][:, None] + ts * fdy[sl][:, None])
+        gs = (foz[sl][:, None] + ts * fdz[sl][:, None]) - fc
+        change = (gs[:, :-1] <= 0) & (gs[:, 1:] > 0)
+        idx = np.argmax(change, axis=-1)
+        has[sl] = change.any(axis=-1)
+        lo[sl] = np.take_along_axis(ts, idx[:, None], axis=-1)[:, 0]
+        hi[sl] = np.take_along_axis(ts, (idx + 1)[:, None], axis=-1)[:, 0]
+    lo, hi, has = lo.reshape(shp), hi.reshape(shp), has.reshape(shp)
 
     # Bisection (robust), then a couple of Newton polishing steps.
     for _ in range(28):
@@ -211,6 +238,57 @@ def _eval_texture(tex: dict, p: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+# Screen-space culling: intersect each primitive only over its projected footprint
+# --------------------------------------------------------------------------
+_CUBE = np.array([[sx, sy, sz] for sx in (-1.0, 1.0)        # 8 unit-cube corners
+                  for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)])
+
+
+def _prim_world_corners(prim):
+    """The primitive's world-space AABB corners (conservative bound), or None if effectively
+    unbounded (Plane/Wavy are finite rectangles but typically frame-filling -- bounded here too)."""
+    if isinstance(prim, Sphere):
+        return prim.center + prim.radius * _CUBE
+    if isinstance(prim, Box):
+        loc = prim.half * _CUBE                              # box-frame corner offsets
+        if prim.R is not None:
+            loc = loc @ prim.R.T                             # box-frame -> world
+        return prim.center + loc
+    if isinstance(prim, Wavy):
+        half = np.array([prim.ex / 2.0, prim.ey / 2.0, prim.amp])
+        return np.array([prim.cx, prim.cy, prim.cz]) + half * _CUBE
+    if isinstance(prim, Plane):
+        return np.array([0.0, 0.0, prim.z]) + np.array([prim.sx, prim.sy, 0.0]) * _CUBE
+    return None
+
+
+def _screen_window(prim, dev, R, C, hw, margin: int = 2):
+    """Conservative pixel window ``(slice_y, slice_x)`` of where ``prim`` can project into device
+    ``dev`` (intrinsics) at world pose (``R`` rows = device axes, ``C`` = centre). Returns the FULL
+    frame when the prim is unbounded or straddles the image plane (projection unreliable -> never
+    cull a possible hit), or ``None`` when it projects entirely off-frame (skip the prim). A convex
+    primitive lies inside its AABB, whose image lies inside the bbox of the projected corners, so the
+    window is a guaranteed superset of every hit pixel (+margin for the index/round convention)."""
+    H, W = hw
+    full = (slice(0, H), slice(0, W))
+    corners = _prim_world_corners(prim)
+    if corners is None:
+        return full
+    pd = (corners - C) @ R.T                                 # device frame (8, 3)
+    if float(np.min(pd[:, 2])) <= 1e-6:                      # any corner behind/at image plane
+        return full
+    u = dev.fx * pd[:, 0] / pd[:, 2] + dev.cx
+    v = dev.fy * pd[:, 1] / pd[:, 2] + dev.cy
+    x0 = max(0, int(np.floor(u.min())) - margin); x1 = min(W, int(np.ceil(u.max())) + margin + 1)
+    y0 = max(0, int(np.floor(v.min())) - margin); y1 = min(H, int(np.ceil(v.max())) + margin + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None                                          # entirely off-frame
+    if (x1 - x0) * (y1 - y0) > 0.9 * H * W:                  # ~full anyway: skip slicing overhead
+        return full
+    return (slice(y0, y1), slice(x0, x1))
+
+
+# --------------------------------------------------------------------------
 # G-buffer
 # --------------------------------------------------------------------------
 @dataclass
@@ -237,16 +315,28 @@ def build_gbuffer(rig: Rig, prims: list) -> GBuffer:
     albedo = np.zeros((H, W, 3))
     obj_id = np.full((H, W), -1, dtype=int)
     for k, prim in enumerate(prims):
-        t, n, hit = _intersect(o, d_world, prim)
-        closer = hit & (t < best_t)
-        best_t = np.where(closer, t, best_t)
-        normal = np.where(closer[..., None], n, normal)
-        alb = prim.reflectance
+        # cull to the primitive's projected pixel window: intersect only those rays, scatter back.
+        win = _screen_window(prim, rig.camera, rig.R_cam, o, (H, W))
+        if win is None:
+            continue                                         # projects entirely off-frame
+        sy, sx = win
+        dW = d_world[sy, sx]
+        t, n, hit = _intersect(o, dW, prim)
+        closer = hit & (t < best_t[sy, sx])
+        best_t[sy, sx] = np.where(closer, t, best_t[sy, sx])
+        normal[sy, sx] = np.where(closer[..., None], n, normal[sy, sx])
         if getattr(prim, "texture", None) is not None:
-            pt = o + np.where(closer, t, 0.0)[..., None] * d_world
-            alb = prim.reflectance * _eval_texture(prim.texture, pt)[..., None]
-        albedo = np.where(closer[..., None], alb, albedo)
-        obj_id = np.where(closer, k, obj_id)
+            # Evaluate the texture ONLY at this object's winning pixels (within the window):
+            # full-frame eval was ~all discarded and ran on off-surface points (overflow spam).
+            mult = np.ones(closer.shape)
+            if closer.any():
+                pt = o + t[closer][..., None] * dW[closer]   # (n_closer, 3) hit points
+                mult[closer] = _eval_texture(prim.texture, pt)
+            alb = np.asarray(prim.reflectance) * mult[..., None]
+        else:
+            alb = prim.reflectance
+        albedo[sy, sx] = np.where(closer[..., None], alb, albedo[sy, sx])
+        obj_id[sy, sx] = np.where(closer, k, obj_id[sy, sx])
     mask = np.isfinite(best_t)
     depth = np.where(mask, best_t, np.nan)
     # Orient world-space normals to face the camera (against the view rays), unit-length.
@@ -268,11 +358,16 @@ def _projector_depth(rig: Rig, prims: list) -> np.ndarray:
     proj_rays = camera_rays(rig.projector)               # (Hp, Wp, 3) in projector frame
     with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
         d_world = proj_rays @ rig.R_proj                  # -> world directions
-        best_t = np.full(proj_rays.shape[:2], np.inf)
+        hw = proj_rays.shape[:2]
+        best_t = np.full(hw, np.inf)
         for prim in prims:
-            t, _, hit = _intersect(centre, d_world, prim)
-            closer = hit & (t < best_t)
-            best_t = np.where(closer, t, best_t)
+            win = _screen_window(prim, rig.projector, rig.R_proj, centre, hw)
+            if win is None:
+                continue
+            sy, sx = win
+            t, _, hit = _intersect(centre, d_world[sy, sx], prim)
+            closer = hit & (t < best_t[sy, sx])
+            best_t[sy, sx] = np.where(closer, t, best_t[sy, sx])
     # As for the camera, t along the world ray equals the projector-frame Z.
     return np.where(np.isfinite(best_t), best_t, np.inf)
 

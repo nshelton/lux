@@ -31,9 +31,11 @@ from lux import codesign as cd
 
 W, H = 1920, 1080
 S = 512                                   # room for coarse-carrier windows + interior
+SS = 4                                    # footprint-integration supersample (matches co-design ss)
 SIGMA_DEF, SIGMA_MTF = 1.0, 0.7           # rig-anchored: projector defocus_px, camera MTF
 FULL_WELL, READ = 200.0, 0.01
 GRAZE_FLOOR = 0.12
+APPEARANCE = "raster"                     # "raster" (appearance-fixed) | "analytic" (old proxy)
 
 
 def gen_for(periods, total_drive=1.5):
@@ -47,14 +49,29 @@ def gen_for(periods, total_drive=1.5):
 
 
 def render(gen, Hinv, th_deg, rng):
-    coords, _ = cd.grid_from_homography(Hinv, (S, S), "cpu", ss=1)
-    pat = gen.sample_at(coords[None], mtf=(SIGMA_MTF, SIGMA_DEF))[0, 0].detach().numpy()
+    """Render one S×S grazing patch through the proxy and return (capture, gt_u_px).
+
+    APPEARANCE='raster' is the appearance-fixed path: the carriers are materialized at projector
+    resolution, **8-bit quantized** (the authored PNG), projector-defocus-blurred, then read through
+    the warp by bilinear ``grid_sample`` (footprint-supersampled + avg-pooled) and camera-MTF-blurred
+    -- the quantized/resampled signal the renderer actually produces. 'analytic' is the pre-fix proxy
+    (continuous carriers evaluated directly, MTF as a per-carrier attenuation) for an A/B."""
+    cg1, _ = cd.grid_from_homography(Hinv, (S, S), "cpu", ss=1)            # GT coords (pixel centres)
+    if APPEARANCE == "raster":
+        cgS, _ = cd.grid_from_homography(Hinv, (S, S), "cpu", ss=SS)       # supersampled footprint
+        raster_at = cd.raster_appearance(gen, sigma_def=SIGMA_DEF, quantize=True)
+        pat = raster_at(cgS[None])                                         # (1,1,SS*S,SS*S) quantized
+        pat = F.avg_pool2d(pat, SS)                                        # footprint area integral
+        pat = cd._fixed_gauss_blur(pat, SIGMA_MTF)                         # camera MTF
+        pat = pat[0, 0].detach().numpy()
+    else:
+        pat = gen.sample_at(cg1[None], mtf=(SIGMA_MTF, SIGMA_DEF))[0, 0].detach().numpy()
     falloff = max(np.cos(np.deg2rad(th_deg)), GRAZE_FLOOR)
     sig = pat * falloff * rng.uniform(0.55, 1.0)
     sig = sig + rng.standard_normal(sig.shape) * np.sqrt(np.clip(sig, 0, None) / FULL_WELL)
     sig = sig + rng.standard_normal(sig.shape) * READ
     sig = np.round(np.clip(sig, 0, 1) * 255) / 255
-    return sig, coords[..., 0].numpy() * W
+    return sig, cg1[..., 0].numpy() * W
 
 
 def _boxblur(x, win):                      # separable uniform filter (fast, O(N*win))
@@ -99,12 +116,58 @@ def sigma_phi(periods, th, rng, n_homog=2, n_real=6):
     return np.mean(out, 0)
 
 
+def intermod_check(periods, total_drive=1.5, bias=0.0):
+    """Re-run the intermod budget on the **quantized rendered spectrum** (the §13-14 check): 8-bit
+    quantization is a static nonlinearity that injects harmonic (2f/3f) + intermod (f_i±f_j) energy.
+    FFT a row of the quantized authored pattern and report, per carrier, its line energy and the
+    worst harmonic/intermod line as a fraction of the weakest carrier -- and flag any harmonic that
+    lands within ±1 bin of a carrier (a collision would corrupt that carrier's phase read)."""
+    g = gen_for(periods, total_drive)
+    with torch.no_grad():
+        g.bias.fill_(bias)
+    row = g.render_proj((W, H), quantize=True)[0, 0, H // 2].detach().numpy()
+    spec = np.abs(np.fft.rfft(row - row.mean()))
+    spec = spec / (spec.max() + 1e-12)
+    nyq = len(spec) - 1
+    cbin = {p: int(round(W / p)) for p in periods}
+    carrier_e = {p: float(spec[cbin[p]]) for p in periods}
+    cmin = min(carrier_e.values())
+    lines = []
+    for p in periods:
+        lines += [(f"2f·p{p}", 2 * W / p), (f"3f·p{p}", 3 * W / p)]
+    for i, pi in enumerate(periods):
+        for pj in periods[i + 1:]:
+            lines += [(f"f{pi}+f{pj}", W / pi + W / pj), (f"|f{pi}-f{pj}|", abs(W / pi - W / pj))]
+    worst, worst_name, collisions = 0.0, "", []
+    for name, fb in lines:
+        b = int(round(fb))
+        if b <= 0 or b >= nyq:
+            continue
+        e = float(spec[b])
+        if e > worst:
+            worst, worst_name = e, name
+        for p in periods:
+            if abs(b - cbin[p]) <= 1:
+                collisions.append((name, p, e))
+    print(f"\n intermod (quantized spectrum, bias {bias:+.2f}, amp {total_drive/len(periods):.2f}/carrier): "
+          f"carrier lines " + " ".join(f"p{p}:{carrier_e[p]:.3f}" for p in periods))
+    print(f"   worst harmonic/intermod line: {worst_name} = {worst:.4f}  "
+          f"({worst/cmin*100:.1f}% of weakest carrier {cmin:.3f})")
+    if collisions:
+        print("   !! COLLISION: harmonic within ±1 bin of a carrier -> " +
+              "; ".join(f"{n} hits p{p} at {e:.3f}" for n, p, e in collisions))
+    else:
+        print("   no harmonic/intermod line lands on a carrier (all >±1 bin away). OK.")
+    return worst / cmin, collisions
+
+
 def main():
     rng = np.random.default_rng(0)
     subsets = [[33, 139], [19, 33, 139], [13, 19, 33, 139]]
     bands = [0, 50, 65, 75]
-    print(f"LOCAL per-pixel demod (window ~3x period). optics sigma_def {SIGMA_DEF} sigma_mtf "
-          f"{SIGMA_MTF}, full_well {FULL_WELL}, graze_floor {GRAZE_FLOOR}. Bar sigma_phi < 0.2 rad.")
+    print(f"APPEARANCE={APPEARANCE}. LOCAL per-pixel demod (window ~3x period). optics sigma_def "
+          f"{SIGMA_DEF} sigma_mtf {SIGMA_MTF}, ss {SS}, full_well {FULL_WELL}, graze_floor "
+          f"{GRAZE_FLOOR}. Bar sigma_phi < 0.2 rad.")
     for periods in subsets:
         wins = [int(np.clip(3 * p, 49, 193)) | 1 for p in periods]
         print(f"\n carriers {periods} (K={len(periods)}, amp {1.5/len(periods):.2f}, windows {wins}px):")
@@ -115,6 +178,10 @@ def main():
             print(f"  {th:4d}deg | " + " | ".join(f"{c:>6}" for c in cells))
     print("\n  '!' = over the 0.2 bar (dead -> magnitude zeros its vote). Fine carriers should blow")
     print("  the bar first at grazing (fine dies); the coarse core should hold (coarse survives).")
+
+    print("\n=== intermod budget under 8-bit quantization (the appearance-fix re-check) ===")
+    for bias in (0.0, 0.4):           # centered + off-center (2f grows with off-center bias, §14)
+        intermod_check([13, 19, 33, 139], bias=bias)
 
 
 if __name__ == "__main__":

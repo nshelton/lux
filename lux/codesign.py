@@ -188,6 +188,29 @@ class PatternGenerator(nn.Module):
         img = self.sample_at(coords)[0, 0].cpu().numpy()       # (h, w)
         return img[None].astype(np.float32)
 
+    def render_proj(self, proj_wh: tuple[int, int] | None = None,
+                    quantize: bool = False) -> torch.Tensor:
+        """Differentiable materialize at projector resolution -> ``(1, 1, Hp, Wp)`` tensor that
+        **carries gradient to the carrier params** (unlike :meth:`materialize`, which detaches).
+
+        ``quantize=True`` applies a straight-through **8-bit** quantization: the forward pass uses
+        the rounded values (the authored PNG that is actually projected), the backward pass is the
+        identity (so amp/phase/bias still learn). This is the appearance the analytic ``sample_at``
+        skipped -- the seam between the proxy's clean carriers and the quantized raster the renderer
+        projects + bilinearly resamples. Optics (defocus / MTF) are applied OUTSIDE this, in image
+        space (see :func:`raster_appearance`), so this stays the clean authored pattern."""
+        w, h = proj_wh or self.proj_wh
+        dev = self.bias.device
+        ys = (torch.arange(h, device=dev, dtype=torch.float32) + 0.5) / h
+        xs = (torch.arange(w, device=dev, dtype=torch.float32) + 0.5) / w
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        coords = torch.stack([gx, gy], dim=-1)[None]           # (1, h, w, 2)
+        img = self.sample_at(coords)                           # (1, 1, h, w), with grad
+        if quantize:
+            q = torch.round(img * 255.0) / 255.0
+            img = img + (q - img).detach()                    # straight-through 8-bit
+        return img
+
     def regularizer(self, tau: float = 0.15) -> torch.Tensor:
         """Anti-collapse reg: carrier repulsion in (log-freq, orientation) space so the
         bank doesn't collapse to one frequency, plus a contrast floor so it doesn't
@@ -458,6 +481,52 @@ def differentiable_augment(x: torch.Tensor, rng, base_psf: float = 0.0) -> torch
     xq = torch.round(x * 255.0) / 255.0                       # 8-bit quantize (STE)
     x = x + (xq - x).detach()
     return _ste_clamp(x, 0.0, 1.0)
+
+
+def _fixed_gauss_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable isotropic Gaussian blur of ``(B,1,H,W)`` by a single scalar ``sigma`` (px),
+    reflect-padded. Differentiable; used for the projector-defocus blur of the materialized raster."""
+    if sigma <= 0:
+        return x
+    radius = max(1, int(round(3 * sigma)))
+    ax = torch.arange(-radius, radius + 1, device=x.device, dtype=torch.float32)
+    k1 = torch.exp(-(ax ** 2) / (2.0 * sigma ** 2))
+    k1 = k1 / k1.sum()
+    kx, ky = k1.view(1, 1, 1, -1), k1.view(1, 1, -1, 1)
+    x = F.conv2d(F.pad(x, (radius, radius, 0, 0), mode="reflect"), kx)
+    x = F.conv2d(F.pad(x, (0, 0, radius, radius), mode="reflect"), ky)
+    return x
+
+
+def raster_appearance(gen, sigma_def: float = 0.0, quantize: bool = True):
+    """Return a ``pattern_at(coords, mtf=None)`` closure that samples the QUANTIZED pattern raster --
+    the appearance fix (``docs/hierarchical_pattern_plan.md`` step 1 / the §11-14 leg).
+
+    The analytic :meth:`PatternGenerator.sample_at` evaluates the continuous carriers directly at the
+    warped coordinate, so the proxy never saw the **8-bit quantization + projector pixel grid +
+    bilinear capture resampling** the real renderer imposes -- the gap that made the proxy-trained
+    decoder collapse to ~58% frontal bin-acc on render. This closure closes it: materialize the
+    carriers at projector resolution and 8-bit-quantize (the authored PNG, via
+    :meth:`PatternGenerator.render_proj`), blur by the projector defocus (``sigma_def`` proj px), then
+    read it back through the camera->projector warp with **bilinear ``grid_sample``** (reflection-
+    padded; the out-of-frame tail is masked by ``valid`` downstream). Fully differentiable to the
+    carrier params -- gradient flows through ``grid_sample``'s input-image gradient into the
+    materialized raster and thence amp/phase/bias.
+
+    The other two optics levers stay where they belong so the geometry coupling is preserved: the
+    **camera MTF** is the augment's ``base_psf`` (camera px), and the **anisotropic grazing blur** is
+    the batcher's footprint supersample (``ss``) + avg-pool (more averaging along the compressed tilt
+    axis = obliquity-coupled, the §13 dominant-lever finding). Signature matches ``sample_at`` (the
+    ``mtf`` kwarg is accepted and ignored) so it is a drop-in for :class:`ProxyBatcher` /
+    :class:`EvalBank`."""
+    def pattern_at(coords: torch.Tensor, mtf=None) -> torch.Tensor:
+        proj = gen.render_proj(quantize=quantize)              # (1,1,Hp,Wp) authored PNG, with grad
+        proj = _fixed_gauss_blur(proj, sigma_def)              # projector defocus (no-op if 0)
+        B = coords.shape[0]
+        grid = coords * 2.0 - 1.0                              # [0,1] -> [-1,1]
+        return F.grid_sample(proj.expand(B, -1, -1, -1).to(coords.device), grid,
+                             mode="bilinear", padding_mode="reflection", align_corners=False)
+    return pattern_at
 
 
 # --------------------------------------------------------------------------
